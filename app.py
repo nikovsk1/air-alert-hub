@@ -46,7 +46,18 @@ ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "admin_super_secret_master
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 CONFIG_FILE = os.path.join(DATA_DIR, "hub_config.json")
 DANGER_RADIUS_KM = float(os.environ.get("DANGER_RADIUS_KM", 35.0))
+UPSTREAM_PROXY = os.environ.get("UPSTREAM_PROXY", "").strip()
 oblast_detector = OblastDetector()
+
+def mask_proxy(p_url: str) -> str:
+    if not p_url: return "Прямое подключение (Без прокси)"
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlsplit(p_url)
+        host = parsed.hostname or parsed.netloc
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except Exception: return "Настроен прокси"
 
 # =====================================================================
 # ХРАНИЛИЩЕ КОНФИГУРАЦИИ И ПОЛЬЗОВАТЕЛЕЙ (PERSISTENCE)
@@ -739,7 +750,11 @@ BROWSER_HEADERS = {
 }
 
 cookie_jar = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+handlers = [urllib.request.HTTPCookieProcessor(cookie_jar)]
+if UPSTREAM_PROXY:
+    logger.info(f"Настроен прокси для апстрима: {mask_proxy(UPSTREAM_PROXY)}")
+    handlers.append(urllib.request.ProxyHandler({'http': UPSTREAM_PROXY, 'https': UPSTREAM_PROXY}))
+opener = urllib.request.build_opener(*handlers)
 
 async def run_ukrainealarm_collector():
     """Основной сборщик данных через WebSocket Centrifugo."""
@@ -1041,6 +1056,29 @@ ADMIN_HTML = """<!DOCTYPE html>
       </div>
     </header>
 
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 my-5">
+      <div class="bg-gray-900 border border-gray-800 p-3.5 rounded-lg flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div id="upstreamDot" class="w-3.5 h-3.5 rounded-full bg-emerald-500 animate-pulse"></div>
+          <div>
+            <div class="text-xs text-gray-400">Источник данных (Апстрим)</div>
+            <div id="upstreamName" class="text-sm font-semibold text-white">Основной (WebSocket map.ukrainealarm.com)</div>
+          </div>
+        </div>
+        <span id="upstreamBadge" class="bg-emerald-950 text-emerald-400 border border-emerald-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold">ОСНОВНОЙ</span>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 p-3.5 rounded-lg flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div id="proxyDot" class="w-3.5 h-3.5 rounded-full bg-blue-500"></div>
+          <div>
+            <div class="text-xs text-gray-400">Режим подключения</div>
+            <div id="proxyName" class="text-sm font-semibold text-white">Прямое подключение (Без прокси)</div>
+          </div>
+        </div>
+        <span id="proxyBadge" class="bg-blue-950 text-blue-400 border border-blue-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold">DIRECT</span>
+      </div>
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 my-6">
       <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
         <div class="text-xs text-gray-400">Физических целей в воздухе</div>
@@ -1098,19 +1136,63 @@ ADMIN_HTML = """<!DOCTYPE html>
     let currentAdminKey = localStorage.getItem("hub_admin_key") || "";
     if (currentAdminKey) document.getElementById("adminKeyInput").value = currentAdminKey;
 
+    async function updateTelemetry() {
+      try {
+        const hRes = await fetch("/api/v1/health");
+        if (!hRes.ok) return;
+        const hData = await hRes.json();
+
+        document.getElementById("statThreats").innerText = hData.active_threats_count ?? "--";
+        document.getElementById("statSirens").innerText = hData.official_sirens_count ?? "--";
+        document.getElementById("statMig").innerText = hData.mig31k_active ? "АКТИВНА" : "НЕТ";
+        document.getElementById("statMig").className = "text-2xl font-bold mt-1 " + (hData.mig31k_active ? "text-red-400 animate-pulse" : "text-cyan-400");
+
+        // Upstream provider
+        const upName = document.getElementById("upstreamName");
+        const upDot = document.getElementById("upstreamDot");
+        const upBadge = document.getElementById("upstreamBadge");
+        if (hData.upstream_provider === "ukrainealarm") {
+          upName.innerText = "Основной поток (WebSocket map.ukrainealarm.com)";
+          upDot.className = "w-3.5 h-3.5 rounded-full bg-emerald-500 animate-pulse";
+          upBadge.innerText = "ОСНОВНОЙ";
+          upBadge.className = "bg-emerald-950 text-emerald-400 border border-emerald-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
+        } else if (hData.upstream_provider === "neptun_failover") {
+          upName.innerText = "Резервный поток (REST neptun.in.ua)";
+          upDot.className = "w-3.5 h-3.5 rounded-full bg-amber-500 animate-pulse";
+          upBadge.innerText = "FAILOVER";
+          upBadge.className = "bg-amber-950 text-amber-400 border border-amber-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
+        } else {
+          upName.innerText = "Ожидание подключения...";
+          upDot.className = "w-3.5 h-3.5 rounded-full bg-gray-500";
+          upBadge.innerText = "CONNECTING";
+          upBadge.className = "bg-gray-800 text-gray-400 border border-gray-700 text-xs px-2.5 py-0.5 rounded font-mono";
+        }
+
+        // Proxy
+        const pName = document.getElementById("proxyName");
+        const pDot = document.getElementById("proxyDot");
+        const pBadge = document.getElementById("proxyBadge");
+        if (hData.proxy_enabled) {
+          pName.innerText = "Прокси активен (" + hData.proxy_info + ")";
+          pDot.className = "w-3.5 h-3.5 rounded-full bg-emerald-500";
+          pBadge.innerText = "PROXY";
+          pBadge.className = "bg-emerald-950 text-emerald-400 border border-emerald-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
+        } else {
+          pName.innerText = "Прямое подключение (Без прокси)";
+          pDot.className = "w-3.5 h-3.5 rounded-full bg-blue-500";
+          pBadge.innerText = "DIRECT";
+          pBadge.className = "bg-blue-950 text-blue-400 border border-blue-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
+        }
+      } catch(e) {}
+    }
+
     async function loadKeys() {
       const key = document.getElementById("adminKeyInput").value.trim();
       if (!key) return alert("Введите мастер-ключ админа");
       currentAdminKey = key;
       localStorage.setItem("hub_admin_key", key);
 
-      try {
-        const hRes = await fetch("/api/v1/health");
-        const hData = await hRes.json();
-        document.getElementById("statThreats").innerText = hData.active_threats_count;
-        document.getElementById("statSirens").innerText = hData.official_sirens_count || 0;
-        document.getElementById("statMig").innerText = hData.mig31k_active ? "АКТИВНА" : "НЕТ";
-      } catch(e) {}
+      updateTelemetry();
 
       try {
         const res = await fetch("/api/v1/admin/keys?admin_key=" + encodeURIComponent(key));
@@ -1224,6 +1306,8 @@ ADMIN_HTML = """<!DOCTYPE html>
       loadKeys();
     }
 
+    updateTelemetry();
+    setInterval(updateTelemetry, 4000);
     if (currentAdminKey) loadKeys();
   </script>
 </body>
@@ -1265,7 +1349,10 @@ def create_app() -> web.Application:
         "active_threats_count": len(state.tracker.tracks),
         "official_sirens_count": len(state.official_alerts),
         "mig31k_active": state.mig_active,
-        "upstream_provider": state.upstream_provider
+        "upstream_provider": state.upstream_provider,
+        "upstream_name": "Основной (WebSocket map.ukrainealarm.com)" if state.upstream_provider == "ukrainealarm" else ("Резервный (REST neptun.in.ua)" if state.upstream_provider == "neptun_failover" else "Ожидание подключения"),
+        "proxy_enabled": bool(UPSTREAM_PROXY),
+        "proxy_info": mask_proxy(UPSTREAM_PROXY)
     }))
     app.router.add_get("/api/v1/slots", handle_get_slots)
     app.router.add_put("/api/v1/slots/{slot_id}", handle_update_slot)
