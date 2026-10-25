@@ -64,11 +64,19 @@ def mask_proxy(p_url: str) -> str:
 # =====================================================================
 
 DEFAULT_USER_SLOTS = {
-    "1": {"id": "1", "name": "Дом (Квартира)", "lat": 50.4501, "lon": 30.5234, "type": "static"},
-    "2": {"id": "2", "name": "Работа / Офис", "lat": 50.4600, "lon": 30.5100, "type": "static"},
-    "3": {"id": "3", "name": "Дача / Родители", "lat": 50.3500, "lon": 30.7000, "type": "static"},
-    "4": {"id": "4", "name": "Школа / Резерв", "lat": 50.4400, "lon": 30.5300, "type": "static"},
-    "5": {"id": "5", "name": "Я (Динамическая)", "lat": 50.4501, "lon": 30.5234, "type": "dynamic", "updated_at": 0, "accuracy_m": 0.0}
+    "1": {"id": "1", "name": "Слот #1 (Дом)", "lat": 50.4501, "lon": 30.5234, "type": "static", "danger_radius_km": 35.0},
+    "2": {"id": "2", "name": "Слот #2 (Работа)", "lat": 50.4600, "lon": 30.5100, "type": "static", "danger_radius_km": 35.0},
+    "3": {"id": "3", "name": "Слот #3 (Дача)", "lat": 50.3500, "lon": 30.7000, "type": "static", "danger_radius_km": 35.0},
+    "4": {"id": "4", "name": "Слот #4 (Школа)", "lat": 50.4400, "lon": 30.5300, "type": "static", "danger_radius_km": 35.0},
+    "5": {"id": "5", "name": "Слот #5 (Динамический GPS)", "lat": 50.4501, "lon": 30.5234, "type": "dynamic", "updated_at": 0, "accuracy_m": 0.0, "danger_radius_km": 35.0}
+}
+
+DEFAULT_USER_SETTINGS = {
+    "danger_radius_km": DANGER_RADIUS_KM, # 35.0 км по умолчанию
+    "alert_threat": True,       # Физическая цель в зоне опасности (< danger_radius_km)
+    "alert_siren": True,        # Официальная сирена в области выбранного слота
+    "alert_mig": False,         # Взлет МиГ-31К / баллистическая угроза по всей стране
+    "alert_artillery": False    # Артобстрел / РСЗО в районе выбранного слота
 }
 
 class StorageManager:
@@ -77,6 +85,22 @@ class StorageManager:
         self.data = {"users": {}}
         self.load()
 
+    def _normalize_user(self, user: dict):
+        """Гарантирует наличие всех слотов, индивидуальных зон опасности и настроек алертов."""
+        if "slots" not in user or not isinstance(user["slots"], dict):
+            user["slots"] = json.loads(json.dumps(DEFAULT_USER_SLOTS))
+        if "settings" not in user or not isinstance(user["settings"], dict):
+            user["settings"] = json.loads(json.dumps(DEFAULT_USER_SETTINGS))
+        else:
+            for k, v in DEFAULT_USER_SETTINGS.items():
+                if k not in user["settings"]:
+                    user["settings"][k] = v
+
+        def_r = float(user["settings"].get("danger_radius_km", DANGER_RADIUS_KM))
+        for slot in user["slots"].values():
+            if "danger_radius_km" not in slot:
+                slot["danger_radius_km"] = def_r
+
     def load(self):
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
         loaded = False
@@ -84,37 +108,22 @@ class StorageManager:
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
+                    if "users" not in self.data or not isinstance(self.data["users"], dict):
+                        self.data = {"users": {}}
                     logger.info(f"Загружено пользователей из базы: {len(self.data.get('users', {}))}")
                     loaded = True
             except Exception as e:
                 logger.error(f"Ошибка чтения {self.filepath}: {e}")
 
         if not loaded:
-            # Начальные пользователи (если база пустая): Муж и Жена
-            self.data = {
-                "users": {
-                    "ak_husband_demo123": {
-                        "id": "usr_husband",
-                        "api_key": "ak_husband_demo123",
-                        "owner": "Муж (Основной)",
-                        "enabled": True,
-                        "created_at": int(time.time()),
-                        "last_used_at": 0,
-                        "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
-                    },
-                    "ak_wife_demo456": {
-                        "id": "usr_wife",
-                        "api_key": "ak_wife_demo456",
-                        "owner": "Жена",
-                        "enabled": True,
-                        "created_at": int(time.time()),
-                        "last_used_at": 0,
-                        "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
-                    }
-                }
-            }
+            # ЧИСТАЯ БАЗА: никаких заготовок, при открытии всё пусто!
+            self.data = {"users": {}}
 
-        # Гарантия сохранения ключей из переменной окружения INITIAL_USERS
+        # Нормализация всех пользователей
+        for u in self.data.get("users", {}).values():
+            self._normalize_user(u)
+
+        # Гарантия сохранения ключей из переменной окружения INITIAL_USERS (если задана)
         # Формат: "Муж:ak_my_key1,Жена:ak_my_key2"
         init_users_env = os.environ.get("INITIAL_USERS", "").strip()
         if init_users_env:
@@ -131,7 +140,8 @@ class StorageManager:
                             "enabled": True,
                             "created_at": int(time.time()),
                             "last_used_at": 0,
-                            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
+                            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS)),
+                            "settings": json.loads(json.dumps(DEFAULT_USER_SETTINGS))
                         }
                         logger.info(f"Добавлен ключ из INITIAL_USERS: {p_name} ({p_key})")
 
@@ -151,6 +161,7 @@ class StorageManager:
     def get_user_by_key(self, api_key: str):
         user = self.data["users"].get(api_key)
         if user and user.get("enabled", True):
+            self._normalize_user(user)
             user["last_used_at"] = int(time.time())
             return user
         return None
@@ -165,7 +176,8 @@ class StorageManager:
             "enabled": True,
             "created_at": int(time.time()),
             "last_used_at": 0,
-            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
+            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS)),
+            "settings": json.loads(json.dumps(DEFAULT_USER_SETTINGS))
         }
         self.data["users"][key] = new_user
         self.save()
@@ -179,6 +191,37 @@ class StorageManager:
         self.save()
         return True
 
+    def update_user_settings(self, api_key: str, settings_update: dict) -> dict:
+        user = self.data["users"].get(api_key)
+        if not user: return None
+        self._normalize_user(user)
+        s = user["settings"]
+        radius_val = None
+        if "danger_radius_km" in settings_update:
+            try:
+                val = float(settings_update["danger_radius_km"])
+                if 1.0 <= val <= 500.0:
+                    s["danger_radius_km"] = round(val, 1)
+                    radius_val = round(val, 1)
+            except (ValueError, TypeError):
+                pass
+        if "alert_threat" in settings_update:
+            s["alert_threat"] = bool(settings_update["alert_threat"])
+        if "alert_siren" in settings_update:
+            s["alert_siren"] = bool(settings_update["alert_siren"])
+        if "alert_mig" in settings_update:
+            s["alert_mig"] = bool(settings_update["alert_mig"])
+        if "alert_artillery" in settings_update:
+            s["alert_artillery"] = bool(settings_update["alert_artillery"])
+
+        # Опционально: применить радиус ко всем слотам этого пользователя
+        if radius_val is not None and settings_update.get("apply_to_all_slots"):
+            for slot in user["slots"].values():
+                slot["danger_radius_km"] = radius_val
+
+        self.save()
+        return s
+
     def delete_user(self, api_key: str) -> bool:
         if api_key in self.data["users"]:
             del self.data["users"][api_key]
@@ -186,27 +229,43 @@ class StorageManager:
             return True
         return False
 
-    def update_slot(self, api_key: str, slot_id: str, name: str, lat: float, lon: float) -> dict:
+    def update_slot(self, api_key: str, slot_id: str, name: str = None, lat: float = None, lon: float = None, danger_radius_km: float = None) -> dict:
         user = self.data["users"].get(api_key)
         if not user or slot_id not in user.get("slots", {}):
             return None
+        self._normalize_user(user)
         slot = user["slots"][slot_id]
         if name: slot["name"] = name
         if lat is not None: slot["lat"] = float(lat)
         if lon is not None: slot["lon"] = float(lon)
+        if danger_radius_km is not None:
+            try:
+                val = float(danger_radius_km)
+                if 1.0 <= val <= 500.0:
+                    slot["danger_radius_km"] = round(val, 1)
+            except (ValueError, TypeError):
+                pass
         self.save()
         return slot
 
-    def update_dynamic_slot(self, api_key: str, lat: float, lon: float, name: str = None, accuracy_m: float = 0.0) -> dict:
+    def update_dynamic_slot(self, api_key: str, lat: float, lon: float, name: str = None, accuracy_m: float = 0.0, danger_radius_km: float = None) -> dict:
         user = self.data["users"].get(api_key)
         if not user or "5" not in user.get("slots", {}):
             return None
+        self._normalize_user(user)
         slot = user["slots"]["5"]
         slot["lat"] = float(lat)
         slot["lon"] = float(lon)
         slot["updated_at"] = int(time.time())
         slot["accuracy_m"] = float(accuracy_m)
         if name: slot["name"] = name
+        if danger_radius_km is not None:
+            try:
+                val = float(danger_radius_km)
+                if 1.0 <= val <= 500.0:
+                    slot["danger_radius_km"] = round(val, 1)
+            except (ValueError, TypeError):
+                pass
         self.save()
         return slot
 
@@ -390,9 +449,24 @@ class ThreatState:
                 disconnected.add(item)
         self.ws_subscribers -= disconnected
 
-    def build_user_snapshot(self, user: dict, slot_id: str = "1", radius_km: float = None, custom_lat: float = None, custom_lon: float = None) -> dict:
+    def build_user_snapshot(self, user: dict, slot_id: str = "1", radius_km: float = None,
+                            custom_lat: float = None, custom_lon: float = None,
+                            danger_radius_km: float = None,
+                            alert_threat: bool = None,
+                            alert_siren: bool = None,
+                            alert_mig: bool = None,
+                            alert_artillery: bool = None) -> dict:
         slots = user.get("slots", DEFAULT_USER_SLOTS)
         target_slot = slots.get(str(slot_id), slots.get("1"))
+
+        # Эффективные настройки опасной зоны и алертов для выбранного слота
+        u_settings = user.get("settings", DEFAULT_USER_SETTINGS)
+        slot_danger = float(target_slot.get("danger_radius_km", u_settings.get("danger_radius_km", DANGER_RADIUS_KM)))
+        eff_danger_km = float(danger_radius_km) if (danger_radius_km is not None and danger_radius_km > 0) else slot_danger
+        eff_alert_threat = alert_threat if alert_threat is not None else bool(u_settings.get("alert_threat", True))
+        eff_alert_siren = alert_siren if alert_siren is not None else bool(u_settings.get("alert_siren", True))
+        eff_alert_mig = alert_mig if alert_mig is not None else bool(u_settings.get("alert_mig", False))
+        eff_alert_artillery = alert_artillery if alert_artillery is not None else bool(u_settings.get("alert_artillery", False))
 
         center_lat = custom_lat if custom_lat is not None else target_slot["lat"]
         center_lon = custom_lon if custom_lon is not None else target_slot["lon"]
@@ -429,6 +503,8 @@ class ThreatState:
 
             eta_min = round((dist / speed) * 60.0, 1) if approach_status == "approaching" and speed > 0 else None
 
+            in_danger = dist <= eff_danger_km
+
             item = {
                 "id": t.id,
                 "type": t.type,
@@ -444,7 +520,7 @@ class ThreatState:
                 "approach_status": approach_status,
                 "approach_desc": approach_desc,
                 "eta_minutes": eta_min,
-                "in_danger_zone": dist <= DANGER_RADIUS_KM,
+                "in_danger_zone": in_danger,
                 "trajectory": t.trajectory, # Тепловой след / история пути
                 "extrapolated_path": t.get_extrapolated_corridor((5, 10, 15)) # Прогноз полета
             }
@@ -453,13 +529,16 @@ class ThreatState:
                 closest_dist = dist
                 closest_threat = item
 
-        # Сводка по всем 5 слотам пользователя (с учетом официальных сирен!)
+        # Сводка по всем 5 слотам пользователя (с учетом индивидуальной опасной зоны каждого слота!)
         user_slots_stats = {}
         for s_id, s_data in slots.items():
             s_lat, s_lon = s_data["lat"], s_data["lon"]
             s_min = 99999.0
             s_type = "Нет"
             s_danger = False
+
+            # Индивидуальный радиус опасности для этого расположения
+            s_danger_km = float(s_data.get("danger_radius_km", u_settings.get("danger_radius_km", DANGER_RADIUS_KM)))
 
             s_info = oblast_detector.find_oblast_info(s_lat, s_lon)
             s_oblast = s_info["name"]
@@ -472,7 +551,7 @@ class ThreatState:
                 if d < s_min:
                     s_min = d
                     s_type = t.type
-                if d <= DANGER_RADIUS_KM:
+                if d <= s_danger_km:
                     s_danger = True
 
             # Официальная тревога в области слота (даже если физических целей еще нет)
@@ -487,6 +566,7 @@ class ThreatState:
                 "lon": s_lon,
                 "oblast": s_oblast,
                 "oblast_id": s_rid,
+                "danger_radius_km": s_danger_km,
                 "siren_active": is_official_alert,
                 "siren_since": alert_meta.get("since"),
                 "mig_threat_active": self.mig_active,
@@ -496,6 +576,25 @@ class ThreatState:
                 "closest_type": s_type if s_min < 90000 else "Спокійно",
                 "danger_zone_active": s_danger
             }
+
+        # Анализ срабатывания звукового оповещения для выбранного слота
+        target_slot_stat = user_slots_stats.get(str(slot_id), {})
+        is_threat_in_target_danger = target_slot_stat.get("danger_zone_active", False)
+        is_siren_in_target_slot = target_slot_stat.get("siren_active", False)
+        is_artillery_in_target_slot = target_slot_stat.get("artillery_active", False)
+        is_mig_active = self.mig_active
+
+        audio_alert_reasons = []
+        if eff_alert_threat and is_threat_in_target_danger:
+            audio_alert_reasons.append("THREAT_IN_DANGER_ZONE")
+        if eff_alert_siren and is_siren_in_target_slot:
+            audio_alert_reasons.append("OBLAST_SIREN")
+        if eff_alert_mig and is_mig_active:
+            audio_alert_reasons.append("MIG31K_AIRBORNE")
+        if eff_alert_artillery and is_artillery_in_target_slot:
+            audio_alert_reasons.append("ARTILLERY_DANGER")
+
+        audio_alert_active = len(audio_alert_reasons) > 0
 
         return {
             "timestamp": int(self.last_update_ts * 1000),
@@ -511,8 +610,18 @@ class ThreatState:
                 "slot_id": slot_id,
                 "name": center_name,
                 "lat": center_lat,
-                "lon": center_lon
+                "lon": center_lon,
+                "danger_radius_km": eff_danger_km
             },
+            "settings": {
+                "danger_radius_km": eff_danger_km,
+                "alert_threat": eff_alert_threat,
+                "alert_siren": eff_alert_siren,
+                "alert_mig": eff_alert_mig,
+                "alert_artillery": eff_alert_artillery
+            },
+            "audio_alert_active": audio_alert_active,
+            "audio_alert_reasons": audio_alert_reasons,
             "closest_threat": closest_threat,
             "slots": user_slots_stats,
             "threats": processed
@@ -520,8 +629,19 @@ class ThreatState:
 
     def build_radar_projection(self, user: dict, slot_id: str = "1", radius_km: float = 100.0,
                                custom_lat: float = None, custom_lon: float = None,
-                               screen_w: int = 368, screen_h: int = 448) -> dict:
-        snapshot = self.build_user_snapshot(user, slot_id=slot_id, radius_km=radius_km, custom_lat=custom_lat, custom_lon=custom_lon)
+                               screen_w: int = 368, screen_h: int = 448,
+                               danger_radius_km: float = None,
+                               alert_threat: bool = None,
+                               alert_siren: bool = None,
+                               alert_mig: bool = None,
+                               alert_artillery: bool = None) -> dict:
+        snapshot = self.build_user_snapshot(user, slot_id=slot_id, radius_km=radius_km,
+                                            custom_lat=custom_lat, custom_lon=custom_lon,
+                                            danger_radius_km=danger_radius_km,
+                                            alert_threat=alert_threat,
+                                            alert_siren=alert_siren,
+                                            alert_mig=alert_mig,
+                                            alert_artillery=alert_artillery)
         center_x, center_y = screen_w / 2.0, screen_h / 2.0
         max_px = min(center_x, center_y) * 0.92
 
@@ -564,18 +684,27 @@ class ThreatState:
             })
 
         slot_stat = snapshot["slots"].get(str(slot_id), {})
+        eff_danger_km = snapshot["settings"]["danger_radius_km"]
+        # Точный радиус зоны опасности в пикселях для отображения окружности на дисплее
+        danger_circle_px = int(round(min(eff_danger_km / radius_km, 1.0) * max_px))
+
         return {
             "timestamp": snapshot["timestamp"],
             "owner": user["owner"],
             "slot_id": slot_id,
             "location_name": snapshot["current_point"]["name"],
             "radius_km": radius_km,
+            "danger_radius_km": eff_danger_km,
+            "danger_circle_px": danger_circle_px,
             "threats_count": len(radar_targets),
             "siren_active": slot_stat.get("siren_active", False),
             "mig_active": snapshot["general_alerts"]["mig31k_active"],
             "closest_km": snapshot["closest_threat"]["distance_km"] if snapshot["closest_threat"] else None,
             "closest_eta": snapshot["closest_threat"]["eta_minutes"] if snapshot["closest_threat"] else None,
-            "danger_active": snapshot["closest_threat"]["in_danger_zone"] if snapshot["closest_threat"] else False,
+            "danger_active": slot_stat.get("danger_zone_active", False),
+            "audio_alert_active": snapshot["audio_alert_active"],
+            "audio_alert_reasons": snapshot["audio_alert_reasons"],
+            "settings": snapshot["settings"],
             "targets": radar_targets
         }
 
@@ -924,20 +1053,26 @@ def is_external_request(request: web.Request) -> bool:
             return True
     return False
 
-def get_authenticated_user(request: web.Request):
-    token = request.query.get("token") or request.headers.get("X-API-Key")
-    if not token:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "): token = auth[7:].strip()
-    if not token: return None
-    return storage.get_user_by_key(token)
-
 def is_admin(request: web.Request) -> bool:
     # Запрещаем любые административные действия из внешнего интернета
     if is_external_request(request):
         return False
     admin_key = request.query.get("admin_key") or request.headers.get("X-Admin-Key")
     return bool(admin_key and admin_key == ADMIN_SECRET_KEY)
+
+def get_authenticated_user(request: web.Request):
+    token = request.query.get("token") or request.headers.get("X-API-Key")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "): token = auth[7:].strip()
+    if not token: return None
+    # Если это админский запрос, разрешаем доступ к профилю даже если ключ отключен
+    if is_admin(request):
+        user = storage.data["users"].get(token)
+        if user:
+            storage._normalize_user(user)
+            return user
+    return storage.get_user_by_key(token)
 
 async def handle_get_slots(request: web.Request):
     user = get_authenticated_user(request)
@@ -950,7 +1085,13 @@ async def handle_update_slot(request: web.Request):
     slot_id = request.match_info.get("slot_id")
     try:
         data = await request.json()
-        slot = storage.update_slot(user["api_key"], slot_id, data.get("name"), data.get("lat"), data.get("lon"))
+        slot = storage.update_slot(
+            user["api_key"], slot_id,
+            name=data.get("name"),
+            lat=data.get("lat"),
+            lon=data.get("lon"),
+            danger_radius_km=data.get("danger_radius_km")
+        )
         if not slot: return web.json_response({"error": "Slot not found"}, status=404)
         return web.json_response({"status": "success", "slot": slot})
     except Exception as e: return web.json_response({"error": str(e)}, status=400)
@@ -960,9 +1101,52 @@ async def handle_update_dynamic(request: web.Request):
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         data = await request.json()
-        slot = storage.update_dynamic_slot(user["api_key"], data.get("lat"), data.get("lon"), data.get("name"), data.get("accuracy_m", 0.0))
+        slot = storage.update_dynamic_slot(
+            user["api_key"],
+            lat=data.get("lat"),
+            lon=data.get("lon"),
+            name=data.get("name"),
+            accuracy_m=data.get("accuracy_m", 0.0),
+            danger_radius_km=data.get("danger_radius_km")
+        )
         return web.json_response({"status": "success", "slot": slot})
     except Exception as e: return web.json_response({"error": str(e)}, status=400)
+
+def parse_bool_param(val):
+    if val is None: return None
+    s = str(val).lower().strip()
+    return s in ("1", "true", "yes", "on")
+
+def parse_float_param(val):
+    if val is None: return None
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except: return None
+
+async def handle_get_settings(request: web.Request):
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    storage._normalize_user(user)
+    return web.json_response({
+        "status": "success",
+        "owner": user["owner"],
+        "settings": user["settings"]
+    })
+
+async def handle_update_settings(request: web.Request):
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        new_settings = storage.update_user_settings(user["api_key"], data)
+        return web.json_response({
+            "status": "success",
+            "owner": user["owner"],
+            "settings": new_settings
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
 
 async def handle_get_threats(request: web.Request):
     user = get_authenticated_user(request)
@@ -973,7 +1157,20 @@ async def handle_get_threats(request: web.Request):
     custom_lat = float(request.query["lat"]) if "lat" in request.query else None
     custom_lon = float(request.query["lon"]) if "lon" in request.query else None
 
-    snapshot = state.build_user_snapshot(user, slot_id=slot_id, radius_km=radius, custom_lat=custom_lat, custom_lon=custom_lon)
+    # Поддержка динамического переопределения радиуса и фильтров в запросе
+    danger_radius = parse_float_param(request.query.get("danger_radius") or request.query.get("danger_radius_km"))
+    alert_threat = parse_bool_param(request.query.get("alert_threat"))
+    alert_siren = parse_bool_param(request.query.get("alert_siren"))
+    alert_mig = parse_bool_param(request.query.get("alert_mig"))
+    alert_artillery = parse_bool_param(request.query.get("alert_artillery"))
+
+    snapshot = state.build_user_snapshot(
+        user, slot_id=slot_id, radius_km=radius,
+        custom_lat=custom_lat, custom_lon=custom_lon,
+        danger_radius_km=danger_radius,
+        alert_threat=alert_threat, alert_siren=alert_siren,
+        alert_mig=alert_mig, alert_artillery=alert_artillery
+    )
     return web.json_response(snapshot)
 
 async def handle_get_radar(request: web.Request):
@@ -987,7 +1184,20 @@ async def handle_get_radar(request: web.Request):
     w = int(request.query.get("w", 368))
     h = int(request.query.get("h", 448))
 
-    radar = state.build_radar_projection(user, slot_id=slot_id, radius_km=radius, custom_lat=custom_lat, custom_lon=custom_lon, screen_w=w, screen_h=h)
+    danger_radius = parse_float_param(request.query.get("danger_radius") or request.query.get("danger_radius_km"))
+    alert_threat = parse_bool_param(request.query.get("alert_threat"))
+    alert_siren = parse_bool_param(request.query.get("alert_siren"))
+    alert_mig = parse_bool_param(request.query.get("alert_mig"))
+    alert_artillery = parse_bool_param(request.query.get("alert_artillery"))
+
+    radar = state.build_radar_projection(
+        user, slot_id=slot_id, radius_km=radius,
+        custom_lat=custom_lat, custom_lon=custom_lon,
+        screen_w=w, screen_h=h,
+        danger_radius_km=danger_radius,
+        alert_threat=alert_threat, alert_siren=alert_siren,
+        alert_mig=alert_mig, alert_artillery=alert_artillery
+    )
     return web.json_response(radar)
 
 async def handle_websocket_stream(request: web.Request):
@@ -1026,6 +1236,7 @@ async def handle_admin_get_keys(request: web.Request):
     if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
     keys_list = []
     for k, u in storage.data["users"].items():
+        storage._normalize_user(u)
         keys_list.append({
             "id": u["id"],
             "owner": u["owner"],
@@ -1033,9 +1244,23 @@ async def handle_admin_get_keys(request: web.Request):
             "enabled": u.get("enabled", True),
             "created_at": u.get("created_at", 0),
             "last_used_at": u.get("last_used_at", 0),
-            "slots_count": len(u.get("slots", {}))
+            "slots_count": len(u.get("slots", {})),
+            "slots": u.get("slots", {}),
+            "settings": u.get("settings", DEFAULT_USER_SETTINGS)
         })
     return web.json_response({"users": keys_list})
+
+async def handle_admin_update_user_settings(request: web.Request):
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    key_id = request.match_info.get("key")
+    try:
+        data = await request.json()
+        new_settings = storage.update_user_settings(key_id, data)
+        if new_settings is None:
+            return web.json_response({"error": "User not found"}, status=404)
+        return web.json_response({"status": "success", "settings": new_settings})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
 
 async def handle_admin_create_key(request: web.Request):
     if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
@@ -1163,31 +1388,187 @@ ADMIN_HTML = """<!DOCTYPE html>
               <th class="p-3">Владелец</th>
               <th class="p-3">API Ключ</th>
               <th class="p-3">Статус</th>
+              <th class="p-3">Опасная зона / Алерты</th>
               <th class="p-3">Был в сети</th>
               <th class="p-3 text-right">Действия</th>
             </tr>
           </thead>
           <tbody id="keysTableBody" class="divide-y divide-gray-800">
-            <tr><td colspan="5" class="p-4 text-center text-gray-500">Введите мастер-ключ админа для загрузки списка</td></tr>
+            <tr><td colspan="6" class="p-4 text-center text-gray-500">Введите мастер-ключ админа для загрузки списка</td></tr>
           </tbody>
         </table>
       </div>
     </div>
 
-    <div id="slotsSection" class="hidden bg-gray-900 border border-gray-800 rounded-lg p-5 my-6">
-      <div class="flex justify-between items-center mb-4">
+    <!-- Панель настройки опасной зоны и фильтров алертов -->
+    <div id="settingsSection" class="hidden bg-gray-900 border border-emerald-900/50 rounded-lg p-5 my-6 shadow-xl">
+      <div class="flex justify-between items-center mb-4 border-b border-gray-800 pb-3">
         <div>
-          <h3 class="font-bold text-white text-lg">Персональные локации: <span id="currentSlotOwner" class="text-blue-400"></span></h3>
-          <p class="text-xs text-gray-400">Слоты используются одновременно на экране ESP32 и в Home Assistant этого пользователя</p>
+          <h3 class="font-bold text-white text-lg flex items-center gap-2">⚙️ Зона опасности и фильтры тревог: <span id="currentSettingsOwner" class="text-emerald-400"></span></h3>
+          <p class="text-xs text-gray-400">Управляет расчетом радиуса поражения и срабатыванием звуковой сирены на ESP32 и в Home Assistant</p>
+        </div>
+        <button onclick="document.getElementById('settingsSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-lg px-2">✕</button>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 bg-gray-950 p-5 rounded-lg border border-gray-800">
+        <!-- Зона опасности -->
+        <div class="space-y-4">
+          <div>
+            <label class="block text-sm font-semibold text-white mb-2">Радиус зоны опасности по умолчанию (Default Danger Zone):</label>
+            <div class="flex items-center gap-4">
+              <input type="range" id="settingDangerRadiusRange" min="5" max="150" step="5" class="w-full accent-emerald-500 cursor-pointer" oninput="syncDangerRadius(this.value)">
+              <div class="flex items-center gap-1.5 shrink-0">
+                <input type="number" id="settingDangerRadiusNum" min="1" max="500" class="w-20 bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-white text-sm font-mono text-center" oninput="syncDangerRadius(this.value)">
+                <span class="text-xs text-gray-400">км</span>
+              </div>
+            </div>
+            <p class="text-xs text-gray-400 mt-2">
+              Если любая цель (Шахед, ракета, КАБ) приближается ближе этой дистанции к выбранной локации, объявляется непосредственная угроза объекту и на экране ESP32 загорается красная зона.
+            </p>
+
+            <label class="flex items-center gap-2 mt-3 p-2 bg-gray-900/90 rounded border border-gray-800 cursor-pointer">
+              <input type="checkbox" id="settingApplyToAllSlots" class="accent-emerald-500 rounded w-4 h-4 cursor-pointer">
+              <span class="text-xs text-emerald-400 font-medium">Применить этот радиус сразу ко всем 5 точкам этого пользователя</span>
+            </label>
+          </div>
+          <div class="bg-gray-900/70 p-3 rounded border border-gray-800 text-xs text-gray-300">
+            <span class="text-emerald-400 font-semibold">Подсказка:</span> Вы также можете задать уникальный радиус для каждой из 5 точек отдельно через кнопку <span class="text-blue-400 font-semibold">«📍 Точки & Зоны (5)»</span> в таблице ключей.
+          </div>
+        </div>
+
+        <!-- Фильтры алертов (ESP32) -->
+        <div class="space-y-4">
+          <label class="block text-sm font-semibold text-white mb-1">Восприятие тревог конечным устройством (Звук на ESP32 / Уведомления):</label>
+          <div class="space-y-3 bg-gray-900/60 p-4 rounded-lg border border-gray-800">
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" id="settingAlertThreat" class="mt-0.5 rounded accent-emerald-500 w-4 h-4 cursor-pointer">
+              <div>
+                <span class="text-sm font-medium text-white">🎯 Физическая цель в зоне опасности (&lt; <span id="labelDangerKm" class="text-emerald-400 font-mono">35</span> км)</span>
+                <p class="text-xs text-gray-400">Звуковой сигнал при приближении реального Шахеда/ракеты в радиус подлёта к выбранной точке.</p>
+              </div>
+            </label>
+
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" id="settingAlertSiren" class="mt-0.5 rounded accent-emerald-500 w-4 h-4 cursor-pointer">
+              <div>
+                <span class="text-sm font-medium text-white">📢 Официальная тревога в области слота</span>
+                <p class="text-xs text-gray-400">Звуковой сигнал при включении областной сирены, даже если физических целей на радаре ещё не зафиксировано.</p>
+              </div>
+            </label>
+
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" id="settingAlertMig" class="mt-0.5 rounded accent-emerald-500 w-4 h-4 cursor-pointer">
+              <div>
+                <span class="text-sm font-medium text-white">✈️ Взлет МиГ-31К / Баллистическая угроза</span>
+                <p class="text-xs text-gray-400">Всеукраинская тревога по гиперзвуковым ракетам «Кинжал» (включайте только если хотите просыпаться при каждом взлёте).</p>
+              </div>
+            </label>
+
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" id="settingAlertArtillery" class="mt-0.5 rounded accent-emerald-500 w-4 h-4 cursor-pointer">
+              <div>
+                <span class="text-sm font-medium text-white">💥 Угроза артобстрела / РСЗО</span>
+                <p class="text-xs text-gray-400">Тревоги артиллерийского обстрела в прифронтовых районах (Никополь, Херсон, Харьков и др.).</p>
+              </div>
+            </label>
+          </div>
         </div>
       </div>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="slotsCardsContainer"></div>
+
+      <div class="mt-5 flex justify-end items-center gap-3">
+        <button onclick="document.getElementById('settingsSection').classList.add('hidden')" class="px-4 py-2 rounded text-xs text-gray-400 hover:text-white transition">Отмена</button>
+        <button onclick="saveUserSettings()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-6 py-2 rounded text-xs transition shadow-lg flex items-center gap-1.5">💾 Сохранить настройки и алерты</button>
+      </div>
+    </div>
+
+    <div id="slotsSection" class="hidden bg-gray-900 border border-blue-900/40 rounded-lg p-5 my-6 shadow-xl">
+      <div class="flex justify-between items-center mb-4 border-b border-gray-800 pb-3">
+        <div>
+          <h3 class="font-bold text-white text-lg flex items-center gap-2">
+            <span>📍 Персональные точки и зоны опасности:</span>
+            <span id="currentSlotOwner" class="text-blue-400 font-mono"></span>
+          </h3>
+          <p class="text-xs text-gray-400">Каждая точка имеет свои координаты и свой собственный радиус опасной зоны (Danger Zone)</p>
+        </div>
+        <button onclick="document.getElementById('slotsSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl px-2">✕</button>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="slotsCardsContainer"></div>
     </div>
   </div>
 
   <script>
     let currentAdminKey = localStorage.getItem("hub_admin_key") || "";
     if (currentAdminKey) document.getElementById("adminKeyInput").value = currentAdminKey;
+    let cachedUsers = {};
+    let currentEditApiKey = "";
+
+    function syncDangerRadius(val) {
+      document.getElementById("settingDangerRadiusRange").value = val;
+      document.getElementById("settingDangerRadiusNum").value = val;
+      document.getElementById("labelDangerKm").innerText = val;
+    }
+
+    function syncSlotDanger(slotId, val) {
+      const r = document.getElementById("danger_range_" + slotId);
+      const n = document.getElementById("danger_num_" + slotId);
+      const l = document.getElementById("danger_val_" + slotId);
+      if (r) r.value = val;
+      if (n) n.value = val;
+      if (l) l.innerText = val + " км";
+    }
+
+    function openUserSettings(apiKey) {
+      const u = cachedUsers[apiKey];
+      if (!u) return alert("Пользователь не найден");
+      currentEditApiKey = apiKey;
+      document.getElementById("currentSettingsOwner").innerText = u.owner;
+      document.getElementById("slotsSection").classList.add("hidden");
+      document.getElementById("settingsSection").classList.remove("hidden");
+
+      const s = u.settings || { danger_radius_km: 35, alert_threat: true, alert_siren: true, alert_mig: false, alert_artillery: false };
+      syncDangerRadius(s.danger_radius_km || 35);
+      const applyAllCheck = document.getElementById("settingApplyToAllSlots");
+      if (applyAllCheck) applyAllCheck.checked = false;
+
+      document.getElementById("settingAlertThreat").checked = s.alert_threat !== false;
+      document.getElementById("settingAlertSiren").checked = s.alert_siren !== false;
+      document.getElementById("settingAlertMig").checked = !!s.alert_mig;
+      document.getElementById("settingAlertArtillery").checked = !!s.alert_artillery;
+
+      document.getElementById("settingsSection").scrollIntoView({ behavior: "smooth" });
+    }
+
+    async function saveUserSettings() {
+      if (!currentEditApiKey) return;
+      const radius = parseFloat(document.getElementById("settingDangerRadiusNum").value) || 35;
+      const applyAll = document.getElementById("settingApplyToAllSlots") ? document.getElementById("settingApplyToAllSlots").checked : false;
+      const payload = {
+        danger_radius_km: radius,
+        apply_to_all_slots: applyAll,
+        alert_threat: document.getElementById("settingAlertThreat").checked,
+        alert_siren: document.getElementById("settingAlertSiren").checked,
+        alert_mig: document.getElementById("settingAlertMig").checked,
+        alert_artillery: document.getElementById("settingAlertArtillery").checked
+      };
+
+      try {
+        const res = await fetch("/api/v1/admin/keys/" + encodeURIComponent(currentEditApiKey) + "/settings?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (res.ok) {
+          alert("Настройки успешно сохранены!");
+          document.getElementById("settingsSection").classList.add("hidden");
+          loadKeys();
+        } else {
+          const err = await res.json();
+          alert("Ошибка сохранения настроек: " + (err.error || "Неизвестная ошибка"));
+        }
+      } catch (e) {
+        alert("Ошибка сети: " + e);
+      }
+    }
 
     async function updateTelemetry() {
       try {
@@ -1257,27 +1638,72 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     function renderKeysTable(users) {
+      cachedUsers = {};
       const tbody = document.getElementById("keysTableBody");
       tbody.innerHTML = "";
+
+      if (!users || users.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="6" class="p-8 text-center text-gray-400">
+              <div class="text-3xl mb-2">📭</div>
+              <div class="font-semibold text-white text-base">Нет созданных API-ключей</div>
+              <p class="text-xs text-gray-500 mt-1 max-w-md mx-auto">
+                База данных чистая. Нажмите кнопку <span class="text-emerald-400 font-semibold">«+ Создать ключ»</span> выше, чтобы добавить первый API-ключ для ESP32 или Home Assistant.
+              </p>
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
       users.forEach(u => {
+        cachedUsers[u.api_key] = u;
         const lastSeen = u.last_used_at ? new Date(u.last_used_at * 1000).toLocaleTimeString() : "Никогда";
+        const s = u.settings || { danger_radius_km: 35, alert_threat: true, alert_siren: true, alert_mig: false, alert_artillery: false };
+
+        // Генерируем компактные плашки с радиусом опасной зоны для каждого слота отдельно
+        const slotsObj = u.slots || {};
+        const slotsBadges = Object.keys(slotsObj).sort().map(sid => {
+          const sl = slotsObj[sid];
+          const rad = sl.danger_radius_km ?? s.danger_radius_km ?? 35;
+          const isDyn = sl.type === "dynamic";
+          return `<span class="inline-block bg-gray-950 border border-gray-800 px-2 py-0.5 rounded text-[11px] text-gray-300" title="Точка #${sid}: ${sl.name || 'Слот'} (${sl.lat}, ${sl.lon})">
+            <span class="text-gray-400 font-medium">#${sid}${isDyn ? ' 📡' : ''} ${sl.name || 'Точка'}:</span> 
+            <span class="text-emerald-400 font-mono font-bold">${rad} км</span>
+          </span>`;
+        }).join(" ");
+
         const tr = document.createElement("tr");
         tr.className = "hover:bg-gray-800/50 transition";
         tr.innerHTML = `
           <td class="p-3 font-medium text-white">${u.owner}</td>
           <td class="p-3 font-mono text-xs text-gray-300">
-            <span class="bg-gray-950 px-2 py-1 rounded border border-gray-800">${u.api_key}</span>
+            <span class="bg-gray-950 px-2 py-1 rounded border border-gray-800 select-all">${u.api_key}</span>
           </td>
           <td class="p-3">
-            <span class="px-2 py-0.5 text-xs rounded ${u.enabled ? 'bg-emerald-900/60 text-emerald-400' : 'bg-red-900/60 text-red-400'}">
+            <span class="px-2 py-0.5 text-xs rounded font-semibold ${u.enabled ? 'bg-emerald-900/60 text-emerald-400' : 'bg-red-900/60 text-red-400'}">
               ${u.enabled ? 'Активен' : 'Отключен'}
             </span>
           </td>
+          <td class="p-3">
+            <div class="text-[11px] text-gray-300 font-semibold mb-1">Зоны опасности (по точкам):</div>
+            <div class="flex flex-wrap gap-1 mb-2">
+              ${slotsBadges || '<span class="text-xs text-gray-500">Нет слотов</span>'}
+            </div>
+            <div class="text-[11px] text-gray-400 flex flex-wrap gap-1">
+              ${s.alert_threat ? '<span class="bg-red-950/80 text-red-400 border border-red-900/60 px-1.5 py-0.5 rounded">🎯 Цели</span>' : '<span class="bg-gray-900 text-gray-600 line-through px-1.5 py-0.5 rounded">🎯 Цели</span>'}
+              ${s.alert_siren ? '<span class="bg-yellow-950/80 text-yellow-400 border border-yellow-900/60 px-1.5 py-0.5 rounded">📢 Сирена</span>' : '<span class="bg-gray-900 text-gray-600 line-through px-1.5 py-0.5 rounded">📢 Сирена</span>'}
+              ${s.alert_mig ? '<span class="bg-cyan-950/80 text-cyan-400 border border-cyan-900/60 px-1.5 py-0.5 rounded">✈️ МиГ</span>' : ''}
+              ${s.alert_artillery ? '<span class="bg-amber-950/80 text-amber-400 border border-amber-900/60 px-1.5 py-0.5 rounded">💥 Арта</span>' : ''}
+            </div>
+          </td>
           <td class="p-3 text-xs text-gray-400">${lastSeen}</td>
-          <td class="p-3 text-right space-x-2">
-            <button onclick="editUserSlots('${u.api_key}', '${u.owner}')" class="bg-blue-600/80 hover:bg-blue-600 text-white px-2.5 py-1 rounded text-xs">Точки (5)</button>
-            <button onclick="toggleKey('${u.api_key}', ${!u.enabled})" class="bg-gray-700 hover:bg-gray-600 text-white px-2 py-1 rounded text-xs">${u.enabled ? 'Выкл' : 'Вкл'}</button>
-            <button onclick="deleteKey('${u.api_key}')" class="text-red-400 hover:text-red-300 px-2 py-1 text-xs">Удалить</button>
+          <td class="p-3 text-right space-x-1.5 whitespace-nowrap">
+            <button onclick="editUserSlots('${u.api_key}', '${u.owner}')" class="bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1 rounded text-xs font-semibold transition" title="Настроить координаты и радиус опасной зоны для каждого из 5 слотов">📍 Точки & Зоны (5)</button>
+            <button onclick="openUserSettings('${u.api_key}')" class="bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded text-xs font-semibold transition" title="Настроить типы звуковых алертов">🔔 Алерты</button>
+            <button onclick="toggleKey('${u.api_key}', ${!u.enabled})" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-2 py-1 rounded text-xs transition">${u.enabled ? 'Выкл' : 'Вкл'}</button>
+            <button onclick="deleteKey('${u.api_key}')" class="text-red-400 hover:text-red-300 px-2 py-1 text-xs transition">Удалить</button>
           </td>
         `;
         tbody.appendChild(tr);
@@ -1285,10 +1711,11 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     async function editUserSlots(apiKey, owner) {
-      const res = await fetch("/api/v1/slots?token=" + apiKey);
+      const res = await fetch("/api/v1/slots?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey));
       if (!res.ok) return alert("Ошибка чтения слотов пользователя");
       const data = await res.json();
 
+      document.getElementById("settingsSection").classList.add("hidden");
       document.getElementById("slotsSection").classList.remove("hidden");
       document.getElementById("currentSlotOwner").innerText = owner;
       const container = document.getElementById("slotsCardsContainer");
@@ -1297,38 +1724,82 @@ ADMIN_HTML = """<!DOCTYPE html>
       Object.keys(data.slots).sort().forEach(slotId => {
         const s = data.slots[slotId];
         const isDyn = s.type === "dynamic";
+        const dangerRadius = s.danger_radius_km ?? 35;
         const card = document.createElement("div");
-        card.className = "bg-gray-950 border border-gray-800 p-3 rounded";
+        card.className = "bg-gray-950 border border-gray-800 p-4 rounded-lg space-y-3";
         card.innerHTML = `
-          <div class="flex justify-between items-center mb-2">
-            <span class="text-xs font-bold text-gray-400">СЛОТ #${slotId} ${isDyn ? '(Динамический GPS)' : ''}</span>
-            <span class="text-xs px-2 py-0.5 rounded ${isDyn ? 'bg-purple-900/60 text-purple-300' : 'bg-blue-900/60 text-blue-300'}">${s.type}</span>
-          </div>
-          <div class="space-y-2">
-            <input id="name_${slotId}" type="text" value="${s.name}" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1 rounded text-sm text-white" placeholder="Название точки">
-            <div class="flex gap-2">
-              <input id="lat_${slotId}" type="number" step="0.0001" value="${s.lat}" class="w-1/2 bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white" placeholder="Широта (Lat)">
-              <input id="lon_${slotId}" type="number" step="0.0001" value="${s.lon}" class="w-1/2 bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white" placeholder="Долгота (Lon)">
+          <div class="flex justify-between items-center pb-2 border-b border-gray-800/80">
+            <div class="flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-blue-900/60 text-blue-300 flex items-center justify-center text-xs font-bold font-mono">#${slotId}</span>
+              <span class="text-sm font-bold text-white">${s.name || ('Слот #' + slotId)}</span>
             </div>
-            <button onclick="saveSlot('${apiKey}', '${slotId}')" class="w-full bg-gray-800 hover:bg-gray-700 text-blue-400 py-1 rounded text-xs font-semibold mt-1">Сохранить слот</button>
+            <span class="text-[10px] px-2 py-0.5 rounded font-mono font-medium ${isDyn ? 'bg-purple-900/60 text-purple-300 border border-purple-800' : 'bg-blue-900/60 text-blue-300 border border-blue-800'}">${isDyn ? 'GPS ДИНАМИЧЕСКИЙ' : 'СТАТИЧЕСКИЙ'}</span>
+          </div>
+
+          <div class="space-y-2">
+            <div>
+              <label class="block text-[11px] font-semibold text-gray-400 mb-1">Название точки:</label>
+              <input id="name_${slotId}" type="text" value="${s.name}" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-sm text-white focus:border-blue-500 focus:outline-none" placeholder="Дом, Работа, Дача...">
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block text-[11px] font-semibold text-gray-400 mb-1">Широта (Lat):</label>
+                <input id="lat_${slotId}" type="number" step="0.0001" value="${s.lat}" class="w-full bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white font-mono" placeholder="50.4501">
+              </div>
+              <div>
+                <label class="block text-[11px] font-semibold text-gray-400 mb-1">Долгота (Lon):</label>
+                <input id="lon_${slotId}" type="number" step="0.0001" value="${s.lon}" class="w-full bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white font-mono" placeholder="30.5234">
+              </div>
+            </div>
+
+            <div class="pt-2 border-t border-gray-900">
+              <div class="flex justify-between items-center text-xs text-gray-300 mb-1">
+                <span class="font-semibold flex items-center gap-1">🚨 Опасная зона (Danger Zone):</span>
+                <span class="font-mono text-emerald-400 font-bold" id="danger_val_${slotId}">${dangerRadius} км</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <input type="range" min="5" max="150" step="5" value="${dangerRadius}" id="danger_range_${slotId}" class="w-full accent-emerald-500 cursor-pointer" oninput="syncSlotDanger('${slotId}', this.value)">
+                <div class="flex items-center gap-1 shrink-0">
+                  <input type="number" min="1" max="500" value="${dangerRadius}" id="danger_num_${slotId}" class="w-16 bg-gray-900 border border-gray-700 px-1.5 py-1 rounded text-xs text-white font-mono text-center" oninput="syncSlotDanger('${slotId}', this.value)">
+                  <span class="text-[10px] text-gray-400">км</span>
+                </div>
+              </div>
+              <p class="text-[10px] text-gray-500 mt-1">Персональный радиус подлёта цели к этой точке</p>
+            </div>
+
+            <button onclick="saveSlot('${apiKey}', '${slotId}')" class="w-full bg-blue-600/80 hover:bg-blue-600 text-white py-1.5 rounded text-xs font-semibold mt-2 transition shadow flex items-center justify-center gap-1">
+              💾 Сохранить точку #${slotId}
+            </button>
           </div>
         `;
         container.appendChild(card);
       });
+
+      document.getElementById("slotsSection").scrollIntoView({ behavior: "smooth" });
     }
 
     async function saveSlot(apiKey, slotId) {
       const name = document.getElementById("name_" + slotId).value;
       const lat = parseFloat(document.getElementById("lat_" + slotId).value);
       const lon = parseFloat(document.getElementById("lon_" + slotId).value);
+      const danger_radius_km = parseFloat(document.getElementById("danger_num_" + slotId).value) || 35.0;
 
-      const res = await fetch("/api/v1/slots/" + slotId + "?token=" + apiKey, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, lat, lon })
-      });
-      if (res.ok) alert("Слот #" + slotId + " успешно сохранён!");
-      else alert("Ошибка сохранения слота");
+      try {
+        const res = await fetch("/api/v1/slots/" + slotId + "?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, lat, lon, danger_radius_km })
+        });
+        if (res.ok) {
+          alert("Точка #" + slotId + " (" + name + ") с радиусом " + danger_radius_km + " км успешно сохранена!");
+          loadKeys();
+        } else {
+          const err = await res.json();
+          alert("Ошибка сохранения: " + (err.error || "Неизвестная ошибка"));
+        }
+      } catch (e) {
+        alert("Ошибка сети: " + e);
+      }
     }
 
     async function toggleKey(key, enabled) {
@@ -1440,6 +1911,9 @@ def create_app() -> web.Application:
     app.router.add_get("/api/v1/slots", handle_get_slots)
     app.router.add_put("/api/v1/slots/{slot_id}", handle_update_slot)
     app.router.add_post("/api/v1/locations/dynamic", handle_update_dynamic)
+    app.router.add_get("/api/v1/settings", handle_get_settings)
+    app.router.add_put("/api/v1/settings", handle_update_settings)
+    app.router.add_post("/api/v1/settings", handle_update_settings)
     app.router.add_get("/api/v1/threats", handle_get_threats)
     app.router.add_get("/api/v1/radar", handle_get_radar)
     app.router.add_get("/api/v1/stream", handle_websocket_stream)
@@ -1448,6 +1922,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/v1/admin/keys", handle_admin_get_keys)
     app.router.add_post("/api/v1/admin/keys", handle_admin_create_key)
     app.router.add_put("/api/v1/admin/keys/{key}", handle_admin_update_key)
+    app.router.add_put("/api/v1/admin/keys/{key}/settings", handle_admin_update_user_settings)
     app.router.add_delete("/api/v1/admin/keys/{key}", handle_admin_delete_key)
     app.router.add_get("/api/v1/admin/backup", handle_admin_backup)
     app.router.add_post("/api/v1/admin/restore", handle_admin_restore)
