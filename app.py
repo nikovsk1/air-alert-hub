@@ -79,38 +79,62 @@ class StorageManager:
 
     def load(self):
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        loaded = False
         if os.path.exists(self.filepath):
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
                     logger.info(f"Загружено пользователей из базы: {len(self.data.get('users', {}))}")
-                    return
+                    loaded = True
             except Exception as e:
                 logger.error(f"Ошибка чтения {self.filepath}: {e}")
 
-        # Начальные пользователи (если база пустая): Муж и Жена
-        self.data = {
-            "users": {
-                "ak_husband_demo123": {
-                    "id": "usr_husband",
-                    "api_key": "ak_husband_demo123",
-                    "owner": "Муж (Основной)",
-                    "enabled": True,
-                    "created_at": int(time.time()),
-                    "last_used_at": 0,
-                    "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
-                },
-                "ak_wife_demo456": {
-                    "id": "usr_wife",
-                    "api_key": "ak_wife_demo456",
-                    "owner": "Жена",
-                    "enabled": True,
-                    "created_at": int(time.time()),
-                    "last_used_at": 0,
-                    "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
+        if not loaded:
+            # Начальные пользователи (если база пустая): Муж и Жена
+            self.data = {
+                "users": {
+                    "ak_husband_demo123": {
+                        "id": "usr_husband",
+                        "api_key": "ak_husband_demo123",
+                        "owner": "Муж (Основной)",
+                        "enabled": True,
+                        "created_at": int(time.time()),
+                        "last_used_at": 0,
+                        "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
+                    },
+                    "ak_wife_demo456": {
+                        "id": "usr_wife",
+                        "api_key": "ak_wife_demo456",
+                        "owner": "Жена",
+                        "enabled": True,
+                        "created_at": int(time.time()),
+                        "last_used_at": 0,
+                        "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
+                    }
                 }
             }
-        }
+
+        # Гарантия сохранения ключей из переменной окружения INITIAL_USERS
+        # Формат: "Муж:ak_my_key1,Жена:ak_my_key2"
+        init_users_env = os.environ.get("INITIAL_USERS", "").strip()
+        if init_users_env:
+            for pair in init_users_env.split(","):
+                if ":" in pair:
+                    p_name, p_key = pair.split(":", 1)
+                    p_name = p_name.strip()
+                    p_key = p_key.strip()
+                    if p_key and p_key not in self.data.setdefault("users", {}):
+                        self.data["users"][p_key] = {
+                            "id": f"usr_{secrets.token_hex(4)}",
+                            "api_key": p_key,
+                            "owner": p_name,
+                            "enabled": True,
+                            "created_at": int(time.time()),
+                            "last_used_at": 0,
+                            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS))
+                        }
+                        logger.info(f"Добавлен ключ из INITIAL_USERS: {p_name} ({p_key})")
+
         self.save()
 
     def save(self):
@@ -1032,6 +1056,30 @@ async def handle_admin_delete_key(request: web.Request):
     ok = storage.delete_user(api_key=key_id)
     return web.json_response({"status": "deleted" if ok else "not_found"})
 
+async def handle_admin_backup(request: web.Request):
+    """Экспорт полной базы пользователей и слотов в JSON-файл."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    content = json.dumps(storage.data, ensure_ascii=False, indent=2)
+    return web.Response(
+        text=content,
+        content_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="air_alert_backup_{int(time.time())}.json"'}
+    )
+
+async def handle_admin_restore(request: web.Request):
+    """Импорт и восстановление базы пользователей и слотов из JSON."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    try:
+        data = await request.json()
+        if "users" not in data or not isinstance(data["users"], dict):
+            return web.json_response({"error": "Неверный формат бэкапа: отсутствует раздел 'users'"}, status=400)
+        storage.data = data
+        storage.save()
+        logger.info(f"База успешно восстановлена из бэкапа: {len(storage.data['users'])} пользователей")
+        return web.json_response({"status": "success", "users_count": len(storage.data['users'])})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1099,9 +1147,14 @@ ADMIN_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden my-6">
-      <div class="p-4 border-b border-gray-800 flex justify-between items-center">
+      <div class="p-4 border-b border-gray-800 flex flex-wrap justify-between items-center gap-3">
         <h2 class="font-semibold text-white">Список пользователей и ключей</h2>
-        <button onclick="openCreateModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded text-xs font-semibold">+ Создать ключ</button>
+        <div class="flex items-center gap-2">
+          <button onclick="downloadBackup()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Сохранить всех пользователей и слоты в JSON">📥 Скачать бэкап</button>
+          <button onclick="document.getElementById('restoreFileInput').click()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Восстановить ключи из сохранённого JSON">📤 Восстановить бэкап</button>
+          <input type="file" id="restoreFileInput" accept=".json" class="hidden" onchange="uploadBackup(event)">
+          <button onclick="openCreateModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded text-xs font-semibold transition">+ Создать ключ</button>
+        </div>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-sm">
@@ -1306,6 +1359,36 @@ ADMIN_HTML = """<!DOCTYPE html>
       loadKeys();
     }
 
+    function downloadBackup() {
+      if (!currentAdminKey) return alert("Сначала введите мастер-ключ админа");
+      window.location.href = "/api/v1/admin/backup?admin_key=" + encodeURIComponent(currentAdminKey);
+    }
+
+    async function uploadBackup(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      if (!currentAdminKey) return alert("Сначала введите мастер-ключ админа");
+      try {
+        const text = await file.text();
+        const json = JSON.parse(text);
+        const res = await fetch("/api/v1/admin/restore?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(json)
+        });
+        const resp = await res.json();
+        if (resp.status === "success") {
+          alert("Бэкап успешно восстановлен! Загружено ключей: " + resp.users_count);
+          loadKeys();
+        } else {
+          alert("Ошибка восстановления: " + (resp.error || "Неизвестная ошибка"));
+        }
+      } catch (e) {
+        alert("Ошибка чтения файла: " + e);
+      }
+      event.target.value = "";
+    }
+
     updateTelemetry();
     setInterval(updateTelemetry, 4000);
     if (currentAdminKey) loadKeys();
@@ -1366,6 +1449,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/v1/admin/keys", handle_admin_create_key)
     app.router.add_put("/api/v1/admin/keys/{key}", handle_admin_update_key)
     app.router.add_delete("/api/v1/admin/keys/{key}", handle_admin_delete_key)
+    app.router.add_get("/api/v1/admin/backup", handle_admin_backup)
+    app.router.add_post("/api/v1/admin/restore", handle_admin_restore)
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
