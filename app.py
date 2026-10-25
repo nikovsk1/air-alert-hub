@@ -862,6 +862,29 @@ async def run_failover_neptun_collector():
 # REST & WEBSOCKET API ЭНДПОИНТЫ
 # =====================================================================
 
+def is_external_request(request: web.Request) -> bool:
+    """
+    Определяет, пришёл ли запрос из внешнего интернета (через Cloudflare Tunnel или внешний прокси).
+    Защищает админку и мастер-ключи от любого доступа извне.
+    """
+    # Cloudflare Tunnel всегда добавляет заголовок CF-Connecting-IP и CF-Ray
+    if request.headers.get("CF-Connecting-IP") or request.headers.get("CF-Ray"):
+        return True
+    # Проверка цепочки прокси X-Forwarded-For на наличие внешних публичных IP
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        client_ip = xff.split(",")[0].strip()
+        # Разрешаем только локальные приватные подсети (LAN)
+        is_private = (
+            client_ip.startswith("192.168.") or
+            client_ip.startswith("10.") or
+            client_ip.startswith("127.") or
+            client_ip.startswith("172.")
+        )
+        if not is_private:
+            return True
+    return False
+
 def get_authenticated_user(request: web.Request):
     token = request.query.get("token") or request.headers.get("X-API-Key")
     if not token:
@@ -871,6 +894,9 @@ def get_authenticated_user(request: web.Request):
     return storage.get_user_by_key(token)
 
 def is_admin(request: web.Request) -> bool:
+    # Запрещаем любые административные действия из внешнего интернета
+    if is_external_request(request):
+        return False
     admin_key = request.query.get("admin_key") or request.headers.get("X-Admin-Key")
     return bool(admin_key and admin_key == ADMIN_SECRET_KEY)
 
@@ -1205,7 +1231,15 @@ ADMIN_HTML = """<!DOCTYPE html>
 """
 
 async def handle_admin_dashboard(request: web.Request):
+    # Если запрос пришёл через Cloudflare Tunnel или извне — возвращаем 404 (будто страницы не существует)
+    if is_external_request(request):
+        return web.Response(text="404: Not Found", status=404)
     return web.Response(text=ADMIN_HTML, content_type="text/html")
+
+async def handle_root(request: web.Request):
+    if is_external_request(request):
+        return web.Response(text="404: Not Found", status=404)
+    raise web.HTTPFound("/admin")
 
 # =====================================================================
 # ИНИЦИАЛИЗАЦИЯ И СТАРТ ПРИЛОЖЕНИЯ
@@ -1224,6 +1258,7 @@ async def on_cleanup(app):
 def create_app() -> web.Application:
     app = web.Application()
 
+    app.router.add_get("/", handle_root)
     app.router.add_get("/api/v1/health", lambda r: web.json_response({
         "status": "ok",
         "service": "Air Alert Hub",
