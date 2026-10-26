@@ -2782,24 +2782,6 @@ ADMIN_HTML = """<!DOCTYPE html>
       }
     }
 
-      try {
-        const res = await fetch("/api/v1/slots/" + slotId + "?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey), {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, lat, lon, danger_radius_km })
-        });
-        if (res.ok) {
-          alert("✅ Точка #" + slotId + " (" + name + ") с радиусом " + danger_radius_km + " км успешно сохранена на диск!");
-          loadKeys();
-        } else {
-          const err = await res.json();
-          alert("Ошибка сохранения: " + (err.error || "Неизвестная ошибка"));
-        }
-      } catch (e) {
-        alert("Ошибка сети: " + e);
-      }
-    }
-
     async function toggleKey(key, enabled) {
       if (!currentAdminKey) return showLoginScreen();
       await fetch("/api/v1/admin/keys/" + encodeURIComponent(key) + "?admin_key=" + encodeURIComponent(currentAdminKey), {
