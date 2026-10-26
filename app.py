@@ -1893,7 +1893,10 @@ ADMIN_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Air Alert Hub - Менеджер ключей и локаций</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <style>body { background-color: #0d1117; color: #c9d1d9; font-family: system-ui, -apple-system, sans-serif; }</style>
+  <style>
+    body { background-color: #0d1117; color: #c9d1d9; font-family: system-ui, -apple-system, sans-serif; }
+    input::-ms-reveal, input::-ms-clear { display: none !important; }
+  </style>
 </head>
 <body class="bg-[#0d1117] text-[#c9d1d9] min-h-screen">
 
@@ -1913,7 +1916,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           <label class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Мастер-ключ администратора</label>
           <div class="relative">
             <input id="loginKeyInput" type="password" required autocomplete="current-password" placeholder="Введите мастер-ключ..." class="w-full bg-gray-950 border border-gray-700 px-3.5 py-2.5 rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 font-mono transition pr-10">
-            <button type="button" onclick="togglePasswordVisibility('loginKeyInput', 'eyeIcon')" class="absolute right-3 top-2.5 text-gray-400 hover:text-white text-sm" title="Показать/скрыть ключ" id="eyeIcon">👁️</button>
+            <button type="button" onclick="const inp=document.getElementById('loginKeyInput'); if(inp){ inp.type = inp.type==='password' ? 'text' : 'password'; this.innerText = inp.type==='password' ? '👁️' : '🙈'; }" class="absolute right-3 top-2.5 text-gray-400 hover:text-white text-sm z-10 cursor-pointer select-none p-1 focus:outline-none" title="Показать/скрыть ключ" id="eyeIcon">👁️</button>
           </div>
         </div>
 
@@ -2217,7 +2220,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     function handleAddSlotLimit() {
-      alert("⚠️ Достигнут лимит точек (Limit reached)!\n\nДля каждого API-ключа разрешено максимум 5 локаций (слоты 1..5).\n\nЧтобы добавить новую локацию, сначала удалите одну из ненужных точек (иконка 🗑️ на карточке).");
+      alert(`⚠️ Достигнут лимит точек (Limit reached)!\n\nДля каждого API-ключа разрешено максимум 5 локаций (слоты 1..5).\n\nЧтобы добавить новую локацию, сначала удалите одну из ненужных точек (иконка 🗑️ на карточке).`);
     }
 
     function toggleAddSlotForm(show) {
@@ -2864,7 +2867,15 @@ async def handle_admin_dashboard(request: web.Request):
     # Если запрос пришёл через Cloudflare Tunnel или извне — возвращаем 404 (будто страницы не существует)
     if is_external_request(request):
         return web.Response(text="404: Not Found", status=404)
-    return web.Response(text=ADMIN_HTML, content_type="text/html")
+    return web.Response(
+        text=ADMIN_HTML,
+        content_type="text/html",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 async def handle_root(request: web.Request):
     if is_external_request(request):
