@@ -2,12 +2,15 @@ import json
 import os
 
 class OblastDetector:
-    """Быстрый локальный детектор областей Украины по координатам (Ray-casting 2D)."""
+    """Быстрый локальный детектор областей Украины по координатам (Ray-casting 2D) и маппер регионов."""
     def __init__(self, geojson_path: str = None):
         if not geojson_path:
             geojson_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "regions.geojson")
         
         self.regions = []
+        self.oblasts_by_id = {}
+        self.region_to_oblast = {}
+
         if not os.path.exists(geojson_path):
             return
 
@@ -15,11 +18,12 @@ class OblastDetector:
             with open(geojson_path, "r", encoding="utf-8") as f:
                 d = json.load(f)
 
+            # 1. Загрузка 26 областей (Rank 1)
             for feat in d.get("features", []):
-                # Нам нужны только области (rank 1)
-                if feat.get("properties", {}).get("rank") == 1:
-                    name = feat["properties"].get("name")
-                    reg_id = feat["properties"].get("regionId")
+                props = feat.get("properties", {})
+                if props.get("rank") == 1:
+                    name = props.get("name")
+                    reg_id = str(props.get("regionId"))
                     geom = feat.get("geometry", {})
                     
                     polygons = []
@@ -32,19 +36,64 @@ class OblastDetector:
                     if not polygons:
                         continue
 
-                    # Вычисление Bounding Box [min_lon, min_lat, max_lon, max_lat]
                     all_pts = [pt for ring in polygons for pt in ring]
                     min_lon = min(pt[0] for pt in all_pts)
                     max_lon = max(pt[0] for pt in all_pts)
                     min_lat = min(pt[1] for pt in all_pts)
                     max_lat = max(pt[1] for pt in all_pts)
 
-                    self.regions.append({
+                    ob_data = {
                         "id": reg_id,
                         "name": name,
                         "bbox": (min_lon, min_lat, max_lon, max_lat),
+                        "center": ((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0),
                         "polygons": polygons
-                    })
+                    }
+                    self.regions.append(ob_data)
+                    self.oblasts_by_id[reg_id] = ob_data
+                    self.region_to_oblast[reg_id] = reg_id
+
+            # 2. Построение маппинга для районов (Rank 2) и громад (Rank 3)
+            for feat in d.get("features", []):
+                props = feat.get("properties", {})
+                if props.get("rank") == 1:
+                    continue
+                rid = str(props.get("regionId"))
+                geom = feat.get("geometry", {})
+                polygons = []
+                if geom.get("type") == "Polygon":
+                    polygons = geom.get("coordinates", [])
+                elif geom.get("type") == "MultiPolygon":
+                    for poly in geom.get("coordinates", []):
+                        polygons.extend(poly)
+                if not polygons or not polygons[0]:
+                    continue
+
+                pt = polygons[0][0]
+                px, py = pt[0], pt[1]
+                f_id = None
+                for r1_id, r1_d in self.oblasts_by_id.items():
+                    b = r1_d["bbox"]
+                    if b[0] <= px <= b[2] and b[1] <= py <= b[3]:
+                        for ring in r1_d["polygons"]:
+                            if self._point_in_polygon(px, py, ring):
+                                f_id = r1_id
+                                break
+                        if f_id:
+                            break
+
+                if not f_id:
+                    best_d = 999999.0
+                    for r1_id, r1_d in self.oblasts_by_id.items():
+                        b = r1_d["bbox"]
+                        dist = (px - (b[0] + b[2]) / 2.0)**2 + (py - (b[1] + b[3]) / 2.0)**2
+                        if dist < best_d:
+                            best_d = dist
+                            f_id = r1_id
+
+                if f_id:
+                    self.region_to_oblast[rid] = f_id
+
         except Exception as e:
             print(f"[WARN] Ошибка загрузки regions.geojson: {e}")
 
@@ -64,6 +113,51 @@ class OblastDetector:
                             inside = not inside
             p1x, p1y = p2x, p2y
         return inside
+
+    def get_oblast_id_by_region(self, region_id: str) -> str:
+        """Возвращает ID области (Rank 1) для любого района или громады."""
+        return self.region_to_oblast.get(str(region_id), "0")
+
+    def get_oblast_id_by_name(self, name: str) -> str:
+        """Поиск ID области по её названию (на украинском языке, с учетом падежей и префиксов)."""
+        if not name:
+            return "0"
+        n = name.lower().strip()
+        if not hasattr(self, "_name_to_id"):
+            self._name_to_id = {}
+            for r in self.regions:
+                r_name = r["name"].lower()
+                self._name_to_id[r_name] = r["id"]
+                short = r_name.replace("область", "").replace("м.", "").strip()
+                self._name_to_id[short] = r["id"]
+            self._name_to_id["автономна республіка крим"] = "9999"
+            self._name_to_id["крим"] = "9999"
+            self._name_to_id["севастополь"] = "9999"
+            self._name_to_id["м. київ"] = "31"
+            self._name_to_id["київ"] = "31"
+
+        if n in self._name_to_id:
+            return self._name_to_id[n]
+        short_n = n.replace("область", "").replace("м.", "").strip()
+        if short_n in self._name_to_id:
+            return self._name_to_id[short_n]
+        for k, v in self._name_to_id.items():
+            if len(k) > 4 and (k in n or n in k):
+                return v
+        return "0"
+
+    def get_all_oblasts(self) -> list:
+        """Возвращает список всех 26 областей Украины с ID, названиями и координатами центра."""
+        result = []
+        for r in self.regions:
+            result.append({
+                "id": r["id"],
+                "name": r["name"],
+                "center_lat": round(r["center"][0], 4),
+                "center_lon": round(r["center"][1], 4),
+                "bbox": [round(x, 4) for x in r["bbox"]]
+            })
+        return result
 
     def find_oblast_info(self, lat: float, lon: float) -> dict:
         if not self.regions:
