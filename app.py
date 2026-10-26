@@ -42,7 +42,9 @@ logger = logging.getLogger("AirAlertHub")
 
 # --- КОНФИГУРАЦИЯ ---
 PORT = int(os.environ.get("PORT", 8088))
-ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "admin_super_secret_master_key_123")
+ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY", "admin_super_secret_master_key_123").strip()
+if not ADMIN_SECRET_KEY:
+    ADMIN_SECRET_KEY = "admin_super_secret_master_key_123"
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 CONFIG_FILE = os.path.join(DATA_DIR, "hub_config.json")
 DANGER_RADIUS_KM = float(os.environ.get("DANGER_RADIUS_KM", 35.0))
@@ -63,13 +65,7 @@ def mask_proxy(p_url: str) -> str:
 # ХРАНИЛИЩЕ КОНФИГУРАЦИИ И ПОЛЬЗОВАТЕЛЕЙ (PERSISTENCE)
 # =====================================================================
 
-DEFAULT_USER_SLOTS = {
-    "1": {"id": "1", "name": "Слот #1 (Дом)", "lat": 50.4501, "lon": 30.5234, "type": "static", "danger_radius_km": 35.0},
-    "2": {"id": "2", "name": "Слот #2 (Работа)", "lat": 50.4600, "lon": 30.5100, "type": "static", "danger_radius_km": 35.0},
-    "3": {"id": "3", "name": "Слот #3 (Дача)", "lat": 50.3500, "lon": 30.7000, "type": "static", "danger_radius_km": 35.0},
-    "4": {"id": "4", "name": "Слот #4 (Школа)", "lat": 50.4400, "lon": 30.5300, "type": "static", "danger_radius_km": 35.0},
-    "5": {"id": "5", "name": "Слот #5 (Динамический GPS)", "lat": 50.4501, "lon": 30.5234, "type": "dynamic", "updated_at": 0, "accuracy_m": 0.0, "danger_radius_km": 35.0}
-}
+DEFAULT_USER_SLOTS = {}
 
 DEFAULT_USER_SETTINGS = {
     "danger_radius_km": DANGER_RADIUS_KM, # 35.0 км по умолчанию
@@ -86,9 +82,9 @@ class StorageManager:
         self.load()
 
     def _normalize_user(self, user: dict):
-        """Гарантирует наличие всех слотов, индивидуальных зон опасности и настроек алертов."""
+        """Гарантирует наличие словаря слотов, индивидуальных зон опасности и настроек алертов."""
         if "slots" not in user or not isinstance(user["slots"], dict):
-            user["slots"] = json.loads(json.dumps(DEFAULT_USER_SLOTS))
+            user["slots"] = {}
         if "settings" not in user or not isinstance(user["settings"], dict):
             user["settings"] = json.loads(json.dumps(DEFAULT_USER_SETTINGS))
         else:
@@ -140,7 +136,7 @@ class StorageManager:
                             "enabled": True,
                             "created_at": int(time.time()),
                             "last_used_at": 0,
-                            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS)),
+                            "slots": {},
                             "settings": json.loads(json.dumps(DEFAULT_USER_SETTINGS))
                         }
                         logger.info(f"Добавлен ключ из INITIAL_USERS: {p_name} ({p_key})")
@@ -148,15 +144,16 @@ class StorageManager:
         self.save()
 
     def save(self):
-        tmp_file = self.filepath + ".tmp"
+        tmp_file = self.filepath + f".tmp.{os.getpid()}"
         try:
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
-            if os.path.exists(self.filepath):
-                os.remove(self.filepath)
             os.replace(tmp_file, self.filepath)
         except Exception as e:
             logger.error(f"Ошибка сохранения {self.filepath}: {e}")
+            if os.path.exists(tmp_file):
+                try: os.remove(tmp_file)
+                except Exception: pass
 
     def get_user_by_key(self, api_key: str):
         user = self.data["users"].get(api_key)
@@ -176,7 +173,7 @@ class StorageManager:
             "enabled": True,
             "created_at": int(time.time()),
             "last_used_at": 0,
-            "slots": json.loads(json.dumps(DEFAULT_USER_SLOTS)),
+            "slots": {},
             "settings": json.loads(json.dumps(DEFAULT_USER_SETTINGS))
         }
         self.data["users"][key] = new_user
@@ -229,13 +226,66 @@ class StorageManager:
             return True
         return False
 
+    def create_slot(self, api_key: str, name: str, lat: float, lon: float, danger_radius_km: float = None, slot_type: str = "static", custom_id: str = None) -> tuple:
+        user = self.data["users"].get(api_key)
+        if not user: return None, "user_not_found"
+        self._normalize_user(user)
+
+        if len(user["slots"]) >= 5:
+            return None, "limit_reached"
+
+        # Находим свободный ID слота от "1" до "5"
+        if custom_id and str(custom_id) in ("1", "2", "3", "4", "5") and str(custom_id) not in user["slots"]:
+            s_id = str(custom_id)
+        else:
+            s_id = None
+            for sid in ("1", "2", "3", "4", "5"):
+                if sid not in user["slots"]:
+                    s_id = sid
+                    break
+        if not s_id:
+            return None, "limit_reached"
+
+        def_r = float(user["settings"].get("danger_radius_km", DANGER_RADIUS_KM))
+        r_val = def_r
+        if danger_radius_km is not None:
+            try:
+                v = float(danger_radius_km)
+                if 1.0 <= v <= 500.0:
+                    r_val = round(v, 1)
+            except (ValueError, TypeError): pass
+
+        new_slot = {
+            "id": s_id,
+            "name": name.strip() if (name and name.strip()) else f"Точка #{s_id}",
+            "lat": float(lat),
+            "lon": float(lon),
+            "type": slot_type if slot_type in ("static", "dynamic") else "static",
+            "danger_radius_km": r_val
+        }
+        if new_slot["type"] == "dynamic":
+            new_slot["updated_at"] = int(time.time())
+            new_slot["accuracy_m"] = 0.0
+
+        user["slots"][s_id] = new_slot
+        self.save()
+        return new_slot, "created"
+
+    def delete_slot(self, api_key: str, slot_id: str) -> bool:
+        user = self.data["users"].get(api_key)
+        if not user or str(slot_id) not in user.get("slots", {}):
+            return False
+        del user["slots"][str(slot_id)]
+        self.save()
+        return True
+
     def update_slot(self, api_key: str, slot_id: str, name: str = None, lat: float = None, lon: float = None, danger_radius_km: float = None) -> dict:
         user = self.data["users"].get(api_key)
-        if not user or slot_id not in user.get("slots", {}):
+        if not user or str(slot_id) not in user.get("slots", {}):
             return None
         self._normalize_user(user)
-        slot = user["slots"][slot_id]
-        if name: slot["name"] = name
+        slot = user["slots"][str(slot_id)]
+        if name: slot["name"] = name.strip()
         if lat is not None: slot["lat"] = float(lat)
         if lon is not None: slot["lon"] = float(lon)
         if danger_radius_km is not None:
@@ -250,24 +300,55 @@ class StorageManager:
 
     def update_dynamic_slot(self, api_key: str, lat: float, lon: float, name: str = None, accuracy_m: float = 0.0, danger_radius_km: float = None) -> dict:
         user = self.data["users"].get(api_key)
-        if not user or "5" not in user.get("slots", {}):
-            return None
+        if not user: return None
         self._normalize_user(user)
-        slot = user["slots"]["5"]
-        slot["lat"] = float(lat)
-        slot["lon"] = float(lon)
-        slot["updated_at"] = int(time.time())
-        slot["accuracy_m"] = float(accuracy_m)
-        if name: slot["name"] = name
+
+        dyn_slot = None
+        for s in user["slots"].values():
+            if s.get("type") == "dynamic":
+                dyn_slot = s
+                break
+
+        if not dyn_slot:
+            if len(user["slots"]) >= 5:
+                if "5" in user["slots"]:
+                    dyn_slot = user["slots"]["5"]
+                    dyn_slot["type"] = "dynamic"
+                else:
+                    return None
+            else:
+                for sid in ("5", "1", "2", "3", "4"):
+                    if sid not in user["slots"]:
+                        s_id = sid
+                        break
+                dyn_slot = {
+                    "id": s_id,
+                    "name": name or "Динамический GPS",
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "type": "dynamic",
+                    "updated_at": int(time.time()),
+                    "accuracy_m": float(accuracy_m),
+                    "danger_radius_km": danger_radius_km or float(user.get("settings", {}).get("danger_radius_km", DANGER_RADIUS_KM))
+                }
+                user["slots"][s_id] = dyn_slot
+                self.save()
+                return dyn_slot
+
+        dyn_slot["lat"] = float(lat)
+        dyn_slot["lon"] = float(lon)
+        dyn_slot["updated_at"] = int(time.time())
+        dyn_slot["accuracy_m"] = float(accuracy_m)
+        if name: dyn_slot["name"] = name.strip()
         if danger_radius_km is not None:
             try:
                 val = float(danger_radius_km)
                 if 1.0 <= val <= 500.0:
-                    slot["danger_radius_km"] = round(val, 1)
+                    dyn_slot["danger_radius_km"] = round(val, 1)
             except (ValueError, TypeError):
                 pass
         self.save()
-        return slot
+        return dyn_slot
 
 storage = StorageManager(CONFIG_FILE)
 
@@ -296,6 +377,139 @@ def bearing_to_compass(deg: float) -> str:
     return sectors[int((deg + 22.5) // 45) % 8]
 
 # =====================================================================
+# РЕЕСТР ТИПОВ ВОЗДУШНЫХ ЦЕЛЕЙ, ПИКТОГРАММЫ И АВТО-ОБНАРУЖЕНИЕ
+# =====================================================================
+
+TARGET_METADATA = {
+    "shahed": {
+        "name_ua": "Шахед",
+        "name_en": "Shahed",
+        "ha_icon": "mdi:navigation-variant",
+        "esp_code": 1,
+        "default_speed": 185.0,
+        "is_drone": True,
+        "color_hex": "#FACC15"
+    },
+    "shahed_jet": {
+        "name_ua": "Реактивний шахед",
+        "name_en": "Jet-powered Shahed",
+        "ha_icon": "mdi:rocket-outline",
+        "esp_code": 2,
+        "default_speed": 380.0,
+        "is_drone": True,
+        "color_hex": "#00E5FF"
+    },
+    "missile": {
+        "name_ua": "Ракета",
+        "name_en": "Missile",
+        "ha_icon": "mdi:rocket",
+        "esp_code": 3,
+        "default_speed": 850.0,
+        "is_drone": False,
+        "color_hex": "#EF4444"
+    },
+    "banderol": {
+        "name_ua": "Бандероль",
+        "name_en": "Banderol",
+        "ha_icon": "mdi:paper-plane-outline",
+        "esp_code": 4,
+        "default_speed": 150.0,
+        "is_drone": True,
+        "color_hex": "#A7F3D0"
+    },
+    "kab": {
+        "name_ua": "КАБ",
+        "name_en": "Guided aerial bomb",
+        "ha_icon": "mdi:bomb",
+        "esp_code": 5,
+        "default_speed": 750.0,
+        "is_drone": False,
+        "color_hex": "#FB923C"
+    },
+    "recon": {
+        "name_ua": "Розвідник",
+        "name_en": "Reconnaissance UAV",
+        "ha_icon": "mdi:crosshairs-gps",
+        "esp_code": 6,
+        "default_speed": 130.0,
+        "is_drone": True,
+        "color_hex": "#A855F7"
+    },
+    "fpv": {
+        "name_ua": "FPV-дрон",
+        "name_en": "FPV drone",
+        "ha_icon": "mdi:quadcopter",
+        "esp_code": 7,
+        "default_speed": 120.0,
+        "is_drone": True,
+        "color_hex": "#F43F5E"
+    },
+    "unknown": {
+        "name_ua": "Ціль не визначена",
+        "name_en": "Unidentified target",
+        "ha_icon": "mdi:help-rhombus",
+        "esp_code": 0,
+        "default_speed": 200.0,
+        "is_drone": True,
+        "color_hex": "#94A3B8"
+    }
+}
+
+UNKNOWN_TARGET_TYPES_CATALOG = {}
+
+def classify_target(raw_type: str, raw_code: int = 0) -> tuple[str, dict]:
+    """
+    Классифицирует цель по сырому имени или коду.
+    Если обнаружен новый, ранее неизвестный тип цели, регистрирует его в каталоге и логирует предупреждение.
+    """
+    s = (raw_type or "").lower().strip()
+
+    if "banderol" in s or "бандероль" in s or s == "ic_banderol" or "decoy" in s:
+        return "banderol", TARGET_METADATA["banderol"]
+
+    if ("jet" in s and "shahed" in s) or "реактив" in s or s in ("ic_shahed_jet", "ic_shahed_jet_mesh", "uav_jet"):
+        return "shahed_jet", TARGET_METADATA["shahed_jet"]
+
+    if "shahed" in s or "шахед" in s or s in ("ic_shahed", "ic_shahed_mesh"):
+        return "shahed", TARGET_METADATA["shahed"]
+
+    if "kab" in s or "каб" in s or "airbomb" in s or s == "ic_airbomb":
+        return "kab", TARGET_METADATA["kab"]
+
+    if "missile" in s or "ракета" in s or "ballistic" in s or "баліст" in s or "kinzhal" in s or s in ("ic_missile", "ic_ballistic") or raw_code in (3, 100, 101, 102, 103, 104, 105, 106, 107):
+        return "missile", TARGET_METADATA["missile"]
+
+    if "fpv" in s:
+        return "fpv", TARGET_METADATA["fpv"]
+
+    if any(k in s for k in ("zala", "supercam", "lancet", "mohajer", "recon", "розвід", "ланцет")):
+        return "recon", TARGET_METADATA["recon"]
+
+    if s in ("ic_air_threat_combined_white", "ic_asterix_plane_stroke", "ic_asterix_plane_masked", "unknown", "ціль не визначена", "не визначена") or raw_code in (116, 200):
+        return "unknown", TARGET_METADATA["unknown"]
+
+    if "drone" in s or "бпла" in s or "uav" in s or raw_code in (8, 11):
+        return "shahed", TARGET_METADATA["shahed"]
+
+    # Авто-регистрация нового или неизвестного типа цели
+    key = raw_type or f"code_{raw_code}"
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if key not in UNKNOWN_TARGET_TYPES_CATALOG:
+        UNKNOWN_TARGET_TYPES_CATALOG[key] = {
+            "type_identifier": key,
+            "raw_code": raw_code,
+            "first_seen": now_iso,
+            "last_seen": now_iso,
+            "count": 1
+        }
+        logger.warning(f"⚠️ [NEW_TARGET_TYPE_DETECTED] Upstream returned new threat type: '{key}' (code={raw_code}). Registered in unknown types catalog.")
+    else:
+        UNKNOWN_TARGET_TYPES_CATALOG[key]["last_seen"] = now_iso
+        UNKNOWN_TARGET_TYPES_CATALOG[key]["count"] += 1
+
+    return "unknown", TARGET_METADATA["unknown"]
+
+# =====================================================================
 # СОПРОВОЖДЕНИЕ ЦЕЛЕЙ (PERSISTENT TRACKER & HEAT TRAIL)
 # =====================================================================
 
@@ -304,12 +518,20 @@ class TargetTrack:
     def __init__(self, target_id: str, t_type: str, raw_code: int, lat: float, lon: float,
                  heading: float, speed_kmh: float, oblast: str, oblast_id: str):
         self.id = target_id
-        self.type = t_type
+        self.raw_type = t_type
         self.raw_code = raw_code
+        cat, meta = classify_target(t_type, raw_code)
+        self.category = cat
+        self.type = meta["name_ua"]
+        self.type_en = meta["name_en"]
+        self.ha_icon = meta["ha_icon"]
+        self.esp_code = meta["esp_code"]
+        self.color_hex = meta["color_hex"]
+        self.is_drone = meta["is_drone"]
         self.lat = lat
         self.lon = lon
         self.heading = heading
-        self.speed_kmh = speed_kmh
+        self.speed_kmh = speed_kmh if (speed_kmh and speed_kmh > 0) else meta["default_speed"]
         self.oblast = oblast
         self.oblast_id = oblast_id
         self.first_seen = time.time()
@@ -317,7 +539,7 @@ class TargetTrack:
         # История точек для построения теплового следа / пройденного пути
         self.trajectory = [{"lat": round(lat, 5), "lon": round(lon, 5), "ts": int(self.last_seen)}]
 
-    def update(self, lat: float, lon: float, heading: float, speed_kmh: float, oblast: str, oblast_id: str):
+    def update(self, lat: float, lon: float, heading: float, speed_kmh: float, oblast: str, oblast_id: str, t_type: str = None, raw_code: int = None):
         now = time.time()
         last_pt = self.trajectory[-1]
         dist_from_last = calculate_haversine_distance(last_pt["lat"], last_pt["lon"], lat, lon)
@@ -328,10 +550,23 @@ class TargetTrack:
             if len(self.trajectory) > 30: # храним до 30 последних точек
                 self.trajectory.pop(0)
 
+        if t_type and t_type != self.raw_type:
+            self.raw_type = t_type
+            if raw_code is not None: self.raw_code = raw_code
+            cat, meta = classify_target(t_type, self.raw_code)
+            self.category = cat
+            self.type = meta["name_ua"]
+            self.type_en = meta["name_en"]
+            self.ha_icon = meta["ha_icon"]
+            self.esp_code = meta["esp_code"]
+            self.color_hex = meta["color_hex"]
+            self.is_drone = meta["is_drone"]
+
         self.lat = lat
         self.lon = lon
         self.heading = heading
-        self.speed_kmh = speed_kmh
+        if speed_kmh and speed_kmh > 0:
+            self.speed_kmh = speed_kmh
         self.oblast = oblast
         self.oblast_id = oblast_id
         self.last_seen = now
@@ -368,26 +603,35 @@ class TargetTracker:
             t_id = t["id"]
             seen_ids.add(t_id)
 
+            lat = float(t.get("lat") or 0.0)
+            lon = float(t.get("lon") or 0.0)
+            heading = float(t.get("heading") or 0.0)
+            speed = float(t.get("speed_kmh") or 0.0)
+            ob_name = t.get("oblast") or oblast_detector.find_oblast(lat, lon)
+            ob_id = t.get("oblast_id") or oblast_detector.get_oblast_id_by_name(ob_name)
+
             if t_id in self.tracks:
                 self.tracks[t_id].update(
-                    lat=t["lat"],
-                    lon=t["lon"],
-                    heading=t["heading"],
-                    speed_kmh=t["speed_kmh"],
-                    oblast=t["oblast"],
-                    oblast_id=t.get("oblast_id", "0")
+                    lat=lat,
+                    lon=lon,
+                    heading=heading,
+                    speed_kmh=speed,
+                    oblast=ob_name,
+                    oblast_id=ob_id,
+                    t_type=t.get("type"),
+                    raw_code=t.get("raw_type_code", 0)
                 )
             else:
                 self.tracks[t_id] = TargetTrack(
                     target_id=t_id,
-                    t_type=t["type"],
-                    raw_code=t["raw_type_code"],
-                    lat=t["lat"],
-                    lon=t["lon"],
-                    heading=t["heading"],
-                    speed_kmh=t["speed_kmh"],
-                    oblast=t["oblast"],
-                    oblast_id=t.get("oblast_id", "0")
+                    t_type=t.get("type", "unknown"),
+                    raw_code=t.get("raw_type_code", 0),
+                    lat=lat,
+                    lon=lon,
+                    heading=heading,
+                    speed_kmh=speed,
+                    oblast=ob_name,
+                    oblast_id=ob_id
                 )
 
         # Очистка исчезнувших целей (если не появлялись в потоке более 25 секунд)
@@ -409,16 +653,132 @@ class ThreatState:
         self.upstream_provider = "none"
         self.ws_subscribers = set()
         # Официальные сирены с сервера
-        self.official_alerts = {} # regionId -> { name, type, since }
+        self.official_alerts = {} # regionId -> { name, type, since, alerts }
         self.mig_active = False
         self.artillery_alerts = set()
         self.alert_reasons = []
+        self.oblast_alerts = {} # oblast_id -> status dict
+        self.recompute_oblast_alerts()
+
+    def recompute_oblast_alerts(self):
+        """Пересчитывает статус всех 26 областей Украины (дрон/желтый, ракета/красный, чисто)."""
+        ob_status = {}
+        for ob in oblast_detector.get_all_oblasts():
+            ob_status[ob["id"]] = {
+                "id": ob["id"],
+                "name": ob["name"],
+                "alert": False,
+                "alert_type": "none", # "none", "drone", "missile", "artillery"
+                "color": "none",      # "none", "yellow", "red"
+                "reasons": [],
+                "since": "",
+                "targets_count": 0
+            }
+
+        # 1. Анализ официальных сирен и районов
+        for rid, a_info in self.official_alerts.items():
+            ob_id = oblast_detector.get_oblast_id_by_region(rid)
+            if ob_id not in ob_status:
+                continue
+            ob = ob_status[ob_id]
+            ob["alert"] = True
+            if not ob["since"] and a_info.get("since"):
+                ob["since"] = a_info["since"]
+
+            active_alerts = a_info.get("alerts", [])
+            if not active_alerts:
+                if ob["alert_type"] == "none":
+                    ob["alert_type"] = "missile"
+                    ob["color"] = "red"
+
+            for al in active_alerts:
+                al_type = al.get("type", "")
+                levels = al.get("activeAlertLevels", [])
+                for lvl in levels:
+                    lvl_level = str(lvl.get("alertLevel", "")).strip().capitalize()
+                    reason = lvl.get("reason", "")
+                    if reason and reason not in ob["reasons"]:
+                        ob["reasons"].append(reason)
+
+                    # Прямая проверка поля alertLevel из mapUpdate ("Yellow" / "Red"):
+                    if lvl_level == "Yellow":
+                        if ob["alert_type"] != "missile":
+                            ob["alert_type"] = "drone"
+                            ob["color"] = "yellow"
+                    elif lvl_level == "Red":
+                        ob["alert_type"] = "missile"
+                        ob["color"] = "red"
+                    else:
+                        # Резервный анализ по тексту причины:
+                        r_lower = reason.lower()
+                        if "дрон" in r_lower or "бпла" in r_lower or "жовт" in r_lower:
+                            if ob["alert_type"] != "missile":
+                                ob["alert_type"] = "drone"
+                                ob["color"] = "yellow"
+                        elif "ракет" in r_lower or "баліст" in r_lower or "червон" in r_lower or "авіац" in r_lower or "каб" in r_lower:
+                            ob["alert_type"] = "missile"
+                            ob["color"] = "red"
+                if al_type in ("ARTILLERY", "URBAN_FIGHTS") or rid in self.artillery_alerts:
+                    ob["alert_type"] = "missile"
+                    ob["color"] = "red"
+                elif ob["alert_type"] == "none":
+                    ob["alert_type"] = "missile"
+                    ob["color"] = "red"
+
+        # 2. Анализ летящих целей в небе (Centrifugo / TargetTracker)
+        for trk in self.tracker.tracks.values():
+            ob_info = oblast_detector.find_oblast_info(trk.lat, trk.lon)
+            ob_id = str(ob_info.get("id", "0"))
+            if ob_id in ob_status:
+                ob = ob_status[ob_id]
+                ob["targets_count"] += 1
+                if trk.is_drone:
+                    if ob["alert_type"] != "missile":
+                        ob["alert"] = True
+                        ob["alert_type"] = "drone"
+                        ob["color"] = "yellow"
+                else:
+                    ob["alert"] = True
+                    ob["alert_type"] = "missile"
+                    ob["color"] = "red"
+
+        self.oblast_alerts = ob_status
+
+    def build_map_snapshot(self) -> dict:
+        """Снапшот стратегической карты Украины для ESP32 и дашбордов."""
+        if not self.oblast_alerts:
+            self.recompute_oblast_alerts()
+        oblasts_list = list(self.oblast_alerts.values())
+        targets_list = []
+        for trk in self.tracker.tracks.values():
+            targets_list.append({
+                "trk_id": trk.id,
+                "lat": round(trk.lat, 4),
+                "lon": round(trk.lon, 4),
+                "heading_deg": round(trk.heading, 1),
+                "speed_kmh": round(trk.speed_kmh, 1),
+                "type": trk.type,
+                "category": getattr(trk, "category", "shahed"),
+                "ha_icon": getattr(trk, "ha_icon", "mdi:crosshairs-gps"),
+                "esp_code": getattr(trk, "esp_code", 1),
+                "color_hex": getattr(trk, "color_hex", "#FACC15"),
+                "is_drone": trk.is_drone
+            })
+        return {
+            "status": "ok",
+            "total_threats": len(self.tracker.tracks),
+            "mig_active": self.mig_active,
+            "updated_at": int(self.last_update_ts),
+            "oblasts": oblasts_list,
+            "targets": targets_list
+        }
 
     async def update_threats(self, raw_targets: list, provider: str):
         async with self.lock:
             self.tracker.update_batch(raw_targets)
             self.last_update_ts = time.time()
             self.upstream_provider = provider
+            self.recompute_oblast_alerts()
         await self.broadcast()
 
     async def update_official_alerts(self, alerts_data: dict):
@@ -430,12 +790,66 @@ class ThreatState:
                     active[rid] = {
                         "name": a.get("regionName", ""),
                         "type": a.get("regionType", ""),
-                        "since": a.get("lastUpdate", "")
+                        "since": a.get("lastUpdate", ""),
+                        "alerts": a.get("activeAlerts", [])
                     }
             self.official_alerts = active
             self.mig_active = len(alerts_data.get("migAlerts", [])) > 0
             self.artillery_alerts = {str(x.get("regionId", "")) for x in alerts_data.get("artillery", [])}
             self.alert_reasons = alerts_data.get("reasons", [])
+            self.recompute_oblast_alerts()
+
+    async def update_neptun_alerts(self, neptun_data: dict):
+        """Резервное обновление официальных сирен и тревог из Neptun API (/api/v1/alerts)."""
+        async with self.lock:
+            active = {}
+            # 1. Анализируем области целиком
+            for ob_item in neptun_data.get("oblasts", []):
+                ob_name = ob_item.get("oblast") or ob_item.get("name", "")
+                ob_id = oblast_detector.get_oblast_id_by_name(ob_name)
+                if ob_id and ob_id != "0":
+                    lvl = "Yellow" if str(ob_item.get("level", "")).lower() == "yellow" else "Red"
+                    active[ob_id] = {
+                        "name": ob_item.get("name", ob_name),
+                        "type": "State",
+                        "since": ob_item.get("since", ""),
+                        "alerts": [{
+                            "type": "AIR",
+                            "activeAlertLevels": [{
+                                "alertLevel": lvl,
+                                "reason": (ob_item.get("reasons") or [""])[0] if ob_item.get("reasons") else ""
+                            }]
+                        }]
+                    }
+            # 2. Анализируем районы
+            for r_item in neptun_data.get("raions", []):
+                ob_name = r_item.get("oblast", "")
+                ob_id = oblast_detector.get_oblast_id_by_name(ob_name)
+                if ob_id and ob_id != "0":
+                    lvl = "Yellow" if str(r_item.get("level", "")).lower() == "yellow" else "Red"
+                    reason = (r_item.get("reasons") or [""])[0] if r_item.get("reasons") else ""
+                    if ob_id not in active:
+                        active[ob_id] = {
+                            "name": ob_name,
+                            "type": "State",
+                            "since": r_item.get("since", ""),
+                            "alerts": [{
+                                "type": "AIR",
+                                "activeAlertLevels": [{
+                                    "alertLevel": lvl,
+                                    "reason": reason
+                                }]
+                            }]
+                        }
+                    else:
+                        # Если в районе красный уровень, поднимаем статус всей области до Red
+                        if lvl == "Red":
+                            active[ob_id]["alerts"][0]["activeAlertLevels"] = [{
+                                "alertLevel": "Red",
+                                "reason": reason
+                            }]
+            self.official_alerts = active
+            self.recompute_oblast_alerts()
 
     async def broadcast(self):
         if not self.ws_subscribers: return
@@ -456,21 +870,23 @@ class ThreatState:
                             alert_siren: bool = None,
                             alert_mig: bool = None,
                             alert_artillery: bool = None) -> dict:
-        slots = user.get("slots", DEFAULT_USER_SLOTS)
-        target_slot = slots.get(str(slot_id), slots.get("1"))
+        slots = user.get("slots", {})
+        target_slot = slots.get(str(slot_id))
+        if not target_slot and slots:
+            target_slot = next(iter(slots.values()))
 
         # Эффективные настройки опасной зоны и алертов для выбранного слота
         u_settings = user.get("settings", DEFAULT_USER_SETTINGS)
-        slot_danger = float(target_slot.get("danger_radius_km", u_settings.get("danger_radius_km", DANGER_RADIUS_KM)))
+        slot_danger = float(target_slot.get("danger_radius_km", u_settings.get("danger_radius_km", DANGER_RADIUS_KM))) if target_slot else float(u_settings.get("danger_radius_km", DANGER_RADIUS_KM))
         eff_danger_km = float(danger_radius_km) if (danger_radius_km is not None and danger_radius_km > 0) else slot_danger
         eff_alert_threat = alert_threat if alert_threat is not None else bool(u_settings.get("alert_threat", True))
         eff_alert_siren = alert_siren if alert_siren is not None else bool(u_settings.get("alert_siren", True))
         eff_alert_mig = alert_mig if alert_mig is not None else bool(u_settings.get("alert_mig", False))
         eff_alert_artillery = alert_artillery if alert_artillery is not None else bool(u_settings.get("alert_artillery", False))
 
-        center_lat = custom_lat if custom_lat is not None else target_slot["lat"]
-        center_lon = custom_lon if custom_lon is not None else target_slot["lon"]
-        center_name = "Пользовательская точка" if custom_lat is not None else target_slot["name"]
+        center_lat = custom_lat if custom_lat is not None else (target_slot["lat"] if target_slot else 50.4501)
+        center_lon = custom_lon if custom_lon is not None else (target_slot["lon"] if target_slot else 30.5234)
+        center_name = "Пользовательская точка" if custom_lat is not None else (target_slot["name"] if target_slot else "Точки не настроены")
 
         active_tracks = list(self.tracker.tracks.values())
         processed = []
@@ -503,11 +919,16 @@ class ThreatState:
 
             eta_min = round((dist / speed) * 60.0, 1) if approach_status == "approaching" and speed > 0 else None
 
-            in_danger = dist <= eff_danger_km
+            in_danger = (dist <= eff_danger_km) if (target_slot or custom_lat is not None) else False
 
             item = {
                 "id": t.id,
                 "type": t.type,
+                "type_en": getattr(t, "type_en", t.type),
+                "category": getattr(t, "category", "shahed"),
+                "ha_icon": getattr(t, "ha_icon", "mdi:crosshairs-gps"),
+                "esp_code": getattr(t, "esp_code", 1),
+                "color_hex": getattr(t, "color_hex", "#FACC15"),
                 "raw_code": t.raw_code,
                 "oblast": t.oblast,
                 "lat": round(lat, 5),
@@ -546,13 +967,23 @@ class ThreatState:
 
             threats_in_s_oblast = sum(1 for trk in active_tracks if trk.oblast == s_oblast)
 
+            s_min_trk = None
             for t in active_tracks:
                 d = calculate_haversine_distance(s_lat, s_lon, t.lat, t.lon)
                 if d < s_min:
                     s_min = d
                     s_type = t.type
+                    s_min_trk = t
                 if d <= s_danger_km:
                     s_danger = True
+
+            s_eta = None
+            if s_min_trk and s_min < 90000 and s_min_trk.speed_kmh > 0:
+                b = calculate_bearing(s_lat, s_lon, s_min_trk.lat, s_min_trk.lon)
+                b_from_t = (b + 180.0) % 360.0
+                diff = abs((s_min_trk.heading - b_from_t + 180.0) % 360.0 - 180.0)
+                if diff < 65.0:
+                    s_eta = round((s_min / s_min_trk.speed_kmh) * 60.0, 1)
 
             # Официальная тревога в области слота (даже если физических целей еще нет)
             is_official_alert = (s_rid in self.official_alerts) or ("31" in self.official_alerts and s_rid == "14")
@@ -574,6 +1005,7 @@ class ThreatState:
                 "threats_in_this_oblast": threats_in_s_oblast,
                 "closest_distance_km": round(s_min, 1) if s_min < 90000 else None,
                 "closest_type": s_type if s_min < 90000 else "Спокійно",
+                "closest_eta_minutes": s_eta,
                 "danger_zone_active": s_danger
             }
 
@@ -624,7 +1056,8 @@ class ThreatState:
             "audio_alert_reasons": audio_alert_reasons,
             "closest_threat": closest_threat,
             "slots": user_slots_stats,
-            "threats": processed
+            "threats": processed,
+            "map_oblasts": list(self.oblast_alerts.values()) if self.oblast_alerts else []
         }
 
     def build_radar_projection(self, user: dict, slot_id: str = "1", radius_km: float = 100.0,
@@ -672,6 +1105,10 @@ class ThreatState:
             radar_targets.append({
                 "id": t["id"],
                 "type": t["type"],
+                "category": t.get("category", "shahed"),
+                "ha_icon": t.get("ha_icon", "mdi:crosshairs-gps"),
+                "esp_code": t.get("esp_code", 1),
+                "color_hex": t.get("color_hex", "#FACC15"),
                 "code": t["raw_code"],
                 "dist_km": t["distance_km"],
                 "bearing": t["bearing_deg"],
@@ -873,14 +1310,16 @@ def extract_targets(decoded_data):
                 name = found_types[typ_idx][1] if typ_idx < len(found_types) else "Ціль"
                 raw_code = found_types[typ_idx][0] if typ_idx < len(found_types) else 0
 
+                cat, meta = classify_target(name, raw_code)
+                speed = meta["default_speed"]
                 ob_info = oblast_detector.find_oblast_info(lat, lon)
-                speed = 280.0 if "jet" in name.lower() else 185.0
 
                 normalized.append({
                     "id": uid,
                     "lat": lat,
                     "lon": lon,
                     "type": name,
+                    "category": cat,
                     "raw_type_code": raw_code,
                     "oblast": ob_info["name"],
                     "oblast_id": ob_info["id"],
@@ -909,6 +1348,12 @@ if UPSTREAM_PROXY:
     handlers.append(urllib.request.ProxyHandler({'http': UPSTREAM_PROXY, 'https': UPSTREAM_PROXY}))
 opener = urllib.request.build_opener(*handlers)
 
+def fetch_url_text(req, opener_inst=None, timeout=10) -> str:
+    """Безопасное чтение HTTP-ответа с гарантированным немедленным закрытием сокета."""
+    op = opener_inst or urllib.request
+    with op.open(req, timeout=timeout) as resp:
+        return resp.read().decode('utf-8')
+
 async def run_ukrainealarm_collector():
     """Основной сборщик данных через WebSocket Centrifugo."""
     import websockets
@@ -916,7 +1361,7 @@ async def run_ukrainealarm_collector():
     while True:
         try:
             req = urllib.request.Request(PAGE_URL, headers=BROWSER_HEADERS)
-            html = await asyncio.to_thread(lambda: opener.open(req, timeout=12).read().decode('utf-8'))
+            html = await asyncio.to_thread(lambda: fetch_url_text(req, opener_inst=opener, timeout=12))
 
             token_m = re.search(r'id=["\']centrifugo-token["\'][^>]*value=["\']([^"\']+)["\']', html)
             auth_token = token_m.group(1) if token_m else None
@@ -954,7 +1399,7 @@ async def run_ukrainealarm_collector():
                             sub_payload = json.dumps({"client": client_id, "channels": [channel]}).encode('utf-8')
                             sub_req = urllib.request.Request(sub_ep, data=sub_payload, headers=s_headers, method="POST")
 
-                            sub_resp_text = await asyncio.to_thread(lambda: opener.open(sub_req, timeout=10).read().decode('utf-8'))
+                            sub_resp_text = await asyncio.to_thread(lambda: fetch_url_text(sub_req, opener_inst=opener, timeout=10))
                             sub_data = json.loads(sub_resp_text)
                             stoken = None
                             if isinstance(sub_data.get("channels"), list):
@@ -982,6 +1427,8 @@ async def run_ukrainealarm_collector():
                             except Exception as ex:
                                 logger.error(f"Decode error: {ex}")
 
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.warning(f"Апстрим реконнект ({e}). Пауза 6 сек...")
             await asyncio.sleep(6)
@@ -993,38 +1440,60 @@ async def run_official_alerts_collector():
     while True:
         try:
             req = urllib.request.Request(update_url, headers=BROWSER_HEADERS)
-            raw = await asyncio.to_thread(lambda: opener.open(req, timeout=10).read().decode('utf-8'))
+            raw = await asyncio.to_thread(lambda: fetch_url_text(req, opener_inst=opener, timeout=10))
             data = json.loads(raw)
             await state.update_official_alerts(data)
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.debug(f"Ошибка обновления официальных сирен: {e}")
         await asyncio.sleep(12) # Опрос раз в 12 секунд
 
 async def run_failover_neptun_collector():
     while True:
-        await asyncio.sleep(6)
-        if time.time() - state.last_update_ts > 45.0:
-            try:
-                req = urllib.request.Request("https://neptun.in.ua/api/v1/threats", headers={"User-Agent": "Mozilla/5.0"})
-                resp = await asyncio.to_thread(lambda: urllib.request.urlopen(req, timeout=8).read().decode('utf-8'))
-                threats_raw = json.loads(resp).get("threats", [])
-                normalized = []
-                for t in threats_raw:
-                    lat, lon = float(t.get("lat", 0.0)), float(t.get("lon", 0.0))
-                    ob_info = oblast_detector.find_oblast_info(lat, lon)
-                    normalized.append({
-                        "id": t.get("id", f"nep_{lat:.2f}"),
-                        "lat": lat,
-                        "lon": lon,
-                        "type": t.get("type", "uav"),
-                        "raw_type_code": 8 if t.get("type") == "uav" else 1,
-                        "oblast": ob_info["name"],
-                        "oblast_id": ob_info["id"],
-                        "heading": float(t.get("heading", 0.0)),
-                        "speed_kmh": 185.0
-                    })
-                await state.update_threats(normalized, provider="neptun_failover")
-            except Exception: pass
+        try:
+            await asyncio.sleep(6)
+            if time.time() - state.last_update_ts > 45.0:
+                # 1. Сбор воздушных целей из Neptun API
+                try:
+                    req = urllib.request.Request("https://neptun.in.ua/api/v1/threats", headers={"User-Agent": "Mozilla/5.0"})
+                    resp = await asyncio.to_thread(lambda: fetch_url_text(req, timeout=8))
+                    threats_raw = json.loads(resp).get("threats", [])
+                    normalized = []
+                    for t in threats_raw:
+                        lat = float(t.get("lat") or 0.0)
+                        lon = float(t.get("lon") or 0.0)
+                        heading = float(t.get("heading") or 0.0)
+                        raw_type = t.get("type", "uav")
+                        raw_code = 8 if raw_type == "uav" else (3 if raw_type in ("missile", "ballistic") else 0)
+                        cat, meta = classify_target(raw_type, raw_code)
+                        ob_info = oblast_detector.find_oblast_info(lat, lon)
+                        normalized.append({
+                            "id": t.get("id", f"nep_{lat:.2f}"),
+                            "lat": lat,
+                            "lon": lon,
+                            "type": raw_type,
+                            "category": cat,
+                            "raw_type_code": raw_code,
+                            "oblast": ob_info["name"],
+                            "oblast_id": ob_info["id"],
+                            "heading": heading,
+                            "speed_kmh": meta["default_speed"]
+                        })
+                    await state.update_threats(normalized, provider="neptun_failover")
+                except Exception as ex_t:
+                    logger.debug(f"Neptun threats failover error: {ex_t}")
+
+                # 2. Резервный сбор официальных сирен и тревог областей из Neptun API
+                try:
+                    req_a = urllib.request.Request("https://neptun.in.ua/api/v1/alerts", headers={"User-Agent": "Mozilla/5.0"})
+                    resp_a = await asyncio.to_thread(lambda: fetch_url_text(req_a, timeout=8))
+                    alerts_raw = json.loads(resp_a)
+                    await state.update_neptun_alerts(alerts_raw)
+                except Exception as ex_a:
+                    logger.debug(f"Neptun alerts failover error: {ex_a}")
+        except asyncio.CancelledError:
+            break
 
 # =====================================================================
 # REST & WEBSOCKET API ЭНДПОИНТЫ
@@ -1057,8 +1526,10 @@ def is_admin(request: web.Request) -> bool:
     # Запрещаем любые административные действия из внешнего интернета
     if is_external_request(request):
         return False
-    admin_key = request.query.get("admin_key") or request.headers.get("X-Admin-Key")
-    return bool(admin_key and admin_key == ADMIN_SECRET_KEY)
+    admin_key = (request.query.get("admin_key") or request.headers.get("X-Admin-Key") or "").strip()
+    if not admin_key or not ADMIN_SECRET_KEY:
+        return False
+    return secrets.compare_digest(admin_key, ADMIN_SECRET_KEY)
 
 def get_authenticated_user(request: web.Request):
     token = request.query.get("token") or request.headers.get("X-API-Key")
@@ -1077,12 +1548,110 @@ def get_authenticated_user(request: web.Request):
 async def handle_get_slots(request: web.Request):
     user = get_authenticated_user(request)
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
-    return web.json_response({"owner": user["owner"], "slots": user["slots"]})
+    storage._normalize_user(user)
+    slots = user.get("slots", {})
+    return web.json_response({
+        "owner": user["owner"],
+        "total_slots": len(slots),
+        "max_slots": 5,
+        "can_add": len(slots) < 5,
+        "slots": slots
+    })
+
+async def handle_create_slot(request: web.Request):
+    """Создать новую точку (слот) для пользователя. Лимит: максимум 5 локаций на ключ."""
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+
+    storage._normalize_user(user)
+    if len(user.get("slots", {})) >= 5:
+        return web.json_response({
+            "error": "Location limit reached",
+            "message": "Maximum 5 locations allowed per API key (limit reached: 5/5). To add a new location, delete an existing slot first.",
+            "limit": 5,
+            "current_count": len(user.get("slots", {}))
+        }, status=400)
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    lat = data.get("lat")
+    lon = data.get("lon")
+    if lat is None or lon is None:
+        return web.json_response({
+            "error": "Missing coordinates",
+            "message": "Both 'lat' and 'lon' are required to create a location."
+        }, status=400)
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (ValueError, TypeError):
+        return web.json_response({
+            "error": "Invalid coordinates",
+            "message": "'lat' and 'lon' must be valid numbers."
+        }, status=400)
+
+    name = str(data.get("name", "")).strip()
+    danger_radius = data.get("danger_radius_km") or data.get("danger_radius")
+    slot_type = data.get("type", "static")
+    custom_id = data.get("slot_id") or data.get("id")
+
+    new_slot, status = storage.create_slot(
+        user["api_key"],
+        name=name,
+        lat=lat,
+        lon=lon,
+        danger_radius_km=danger_radius,
+        slot_type=slot_type,
+        custom_id=custom_id
+    )
+
+    if not new_slot:
+        if status == "limit_reached":
+            return web.json_response({
+                "error": "Location limit reached",
+                "message": "Maximum 5 locations allowed per API key (limit reached: 5/5).",
+                "limit": 5,
+                "current_count": len(user.get("slots", {}))
+            }, status=400)
+        return web.json_response({"error": "Failed to create location"}, status=400)
+
+    return web.json_response({
+        "status": "success",
+        "slot": new_slot,
+        "total_slots": len(user.get("slots", {})),
+        "max_slots": 5,
+        "can_add": len(user.get("slots", {})) < 5
+    }, status=201)
+
+async def handle_delete_slot(request: web.Request):
+    """Удалить точку (слот) пользователя."""
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    slot_id = str(request.match_info.get("slot_id", "")).strip()
+    ok = storage.delete_slot(user["api_key"], slot_id)
+    if not ok:
+        return web.json_response({"error": f"Slot #{slot_id} not found"}, status=404)
+    return web.json_response({
+        "status": "deleted",
+        "slot_id": slot_id,
+        "remaining_slots": len(user.get("slots", {})),
+        "can_add": len(user.get("slots", {})) < 5
+    })
 
 async def handle_update_slot(request: web.Request):
     user = get_authenticated_user(request)
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
-    slot_id = request.match_info.get("slot_id")
+    slot_id = str(request.match_info.get("slot_id", "")).strip()
+    if slot_id not in ("1", "2", "3", "4", "5"):
+        return web.json_response({
+            "error": "Location limit reached",
+            "message": f"Slot #{slot_id} is invalid. Maximum 5 locations allowed per API key (slots 1 to 5).",
+            "limit": 5
+        }, status=400)
     try:
         data = await request.json()
         slot = storage.update_slot(
@@ -1200,6 +1769,12 @@ async def handle_get_radar(request: web.Request):
     )
     return web.json_response(radar)
 
+async def handle_get_map(request: web.Request):
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    snapshot = state.build_map_snapshot()
+    return web.json_response(snapshot)
+
 async def handle_websocket_stream(request: web.Request):
     user = get_authenticated_user(request)
     if not user: return web.Response(text="Unauthorized", status=401)
@@ -1231,6 +1806,12 @@ async def handle_websocket_stream(request: web.Request):
 # =====================================================================
 # ADMIN API & WEB DASHBOARD
 # =====================================================================
+
+async def handle_admin_verify(request: web.Request):
+    """Проверка валидности мастер-ключа админа."""
+    if not is_admin(request):
+        return web.json_response({"error": "Admin unauthorized", "authenticated": False}, status=403)
+    return web.json_response({"status": "ok", "authenticated": True})
 
 async def handle_admin_get_keys(request: web.Request):
     if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
@@ -1314,8 +1895,54 @@ ADMIN_HTML = """<!DOCTYPE html>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>body { background-color: #0d1117; color: #c9d1d9; font-family: system-ui, -apple-system, sans-serif; }</style>
 </head>
-<body class="p-4 md:p-8">
-  <div class="max-w-5xl mx-auto">
+<body class="bg-[#0d1117] text-[#c9d1d9] min-h-screen">
+
+  <!-- 1. ЭКРАН ВХОДА (LOGIN GATE) -->
+  <div id="loginScreen" class="min-h-screen flex items-center justify-center p-4">
+    <div class="bg-gray-900 border border-gray-800 rounded-2xl p-6 md:p-8 max-w-md w-full shadow-2xl">
+      <div class="text-center mb-6">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-950/70 border border-red-800/60 text-red-500 text-3xl mb-3 shadow-inner">
+          🛡️
+        </div>
+        <h1 class="text-xl font-bold text-white tracking-wide">Air Alert Radar Hub</h1>
+        <p class="text-xs text-gray-400 mt-1">Доступ к панели управления администратора</p>
+      </div>
+
+      <form id="loginForm" onsubmit="handleLoginSubmit(event)" class="space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Мастер-ключ администратора</label>
+          <div class="relative">
+            <input id="loginKeyInput" type="password" required autocomplete="current-password" placeholder="Введите мастер-ключ..." class="w-full bg-gray-950 border border-gray-700 px-3.5 py-2.5 rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 font-mono transition pr-10">
+            <button type="button" onclick="togglePasswordVisibility('loginKeyInput', 'eyeIcon')" class="absolute right-3 top-2.5 text-gray-400 hover:text-white text-sm" title="Показать/скрыть ключ" id="eyeIcon">👁️</button>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between text-xs">
+          <label class="flex items-center gap-2 text-gray-400 cursor-pointer select-none">
+            <input type="checkbox" id="rememberKeyCheck" checked class="accent-emerald-500 rounded w-4 h-4 cursor-pointer">
+            <span>Запомнить в этом браузере</span>
+          </label>
+        </div>
+
+        <div id="loginError" class="hidden p-3 rounded-lg bg-red-950/80 border border-red-800 text-red-400 text-xs font-medium">
+          ❌ Неверный мастер-ключ! Проверьте переменную ADMIN_SECRET_KEY в настройках контейнера.
+        </div>
+
+        <button type="submit" id="loginBtn" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2.5 rounded-lg text-sm transition shadow-lg flex items-center justify-center gap-2 cursor-pointer">
+          <span>🔓 Войти в панель управления</span>
+        </button>
+      </form>
+
+      <div class="mt-6 pt-4 border-t border-gray-800 text-center">
+        <p class="text-[11px] text-gray-500">
+          Все добавленные ключи, координаты и настройки опасных зон сохраняются локально на диск в автоматическом режиме.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. ОСНОВНОЙ ДАШБОРД (СКРЫТ ДО АВТОРИЗАЦИИ) -->
+  <div id="adminApp" class="hidden max-w-5xl mx-auto p-4 md:p-8">
     <header class="flex flex-col md:flex-row justify-between items-start md:items-center pb-6 border-b border-gray-800 gap-4">
       <div>
         <h1 class="text-2xl font-bold text-white flex items-center gap-2">
@@ -1323,9 +1950,14 @@ ADMIN_HTML = """<!DOCTYPE html>
         </h1>
         <p class="text-sm text-gray-400">Центр управления API-ключами, официальными сиренами и радаром (Home Assistant & ESP32)</p>
       </div>
-      <div class="flex items-center gap-2">
-        <input id="adminKeyInput" type="password" placeholder="Мастер-ключ админа" class="bg-gray-900 border border-gray-700 px-3 py-1.5 rounded text-sm text-white focus:outline-none focus:border-blue-500">
-        <button onclick="loadKeys()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded text-sm font-medium transition">Войти</button>
+      <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2 bg-emerald-950/80 border border-emerald-800/80 px-3.5 py-1.5 rounded-lg shadow-sm">
+          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span class="text-xs text-emerald-300 font-semibold font-mono">✅ Мастер-ключ принят | Админ</span>
+        </div>
+        <button onclick="handleLogout()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 hover:text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition flex items-center gap-1.5 shadow" title="Выйти из сессии админа">
+          <span>🚪 Выйти</span>
+        </button>
       </div>
     </header>
 
@@ -1352,6 +1984,13 @@ ADMIN_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div id="unknownTypesBanner" class="hidden my-4 p-3.5 bg-amber-950/80 border border-amber-600 rounded-lg text-amber-200 text-xs flex items-center justify-between shadow-lg">
+      <div class="flex items-center gap-2.5">
+        <span class="text-base">⚠️</span>
+        <div id="unknownTypesText"></div>
+      </div>
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 my-6">
       <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
         <div class="text-xs text-gray-400">Физических целей в воздухе</div>
@@ -1371,14 +2010,14 @@ ADMIN_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden my-6">
+    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden my-6 shadow-lg">
       <div class="p-4 border-b border-gray-800 flex flex-wrap justify-between items-center gap-3">
         <h2 class="font-semibold text-white">Список пользователей и ключей</h2>
         <div class="flex items-center gap-2">
-          <button onclick="downloadBackup()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Сохранить всех пользователей и слоты в JSON">📥 Скачать бэкап</button>
-          <button onclick="document.getElementById('restoreFileInput').click()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Восстановить ключи из сохранённого JSON">📤 Восстановить бэкап</button>
+          <button onclick="downloadBackup()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Сохранить всех пользователей и слоты в JSON на свой ПК">📥 Скачать бэкап</button>
+          <button onclick="document.getElementById('restoreFileInput').click()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Восстановить ключи из сохранённого JSON-файла">📤 Восстановить бэкап</button>
           <input type="file" id="restoreFileInput" accept=".json" class="hidden" onchange="uploadBackup(event)">
-          <button onclick="openCreateModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded text-xs font-semibold transition">+ Создать ключ</button>
+          <button onclick="openCreateModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded text-xs font-semibold transition shadow">+ Создать ключ</button>
         </div>
       </div>
       <div class="overflow-x-auto">
@@ -1394,7 +2033,7 @@ ADMIN_HTML = """<!DOCTYPE html>
             </tr>
           </thead>
           <tbody id="keysTableBody" class="divide-y divide-gray-800">
-            <tr><td colspan="6" class="p-4 text-center text-gray-500">Введите мастер-ключ админа для загрузки списка</td></tr>
+            <tr><td colspan="6" class="p-8 text-center text-gray-500">Загрузка данных...</td></tr>
           </tbody>
         </table>
       </div>
@@ -1482,25 +2121,227 @@ ADMIN_HTML = """<!DOCTYPE html>
     </div>
 
     <div id="slotsSection" class="hidden bg-gray-900 border border-blue-900/40 rounded-lg p-5 my-6 shadow-xl">
-      <div class="flex justify-between items-center mb-4 border-b border-gray-800 pb-3">
+      <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 border-b border-gray-800 pb-3 gap-3">
         <div>
-          <h3 class="font-bold text-white text-lg flex items-center gap-2">
-            <span>📍 Персональные точки и зоны опасности:</span>
-            <span id="currentSlotOwner" class="text-blue-400 font-mono"></span>
-          </h3>
-          <p class="text-xs text-gray-400">Каждая точка имеет свои координаты и свой собственный радиус опасной зоны (Danger Zone)</p>
+          <div class="flex items-center gap-2 flex-wrap">
+            <h3 class="font-bold text-white text-lg flex items-center gap-2">
+              <span>📍 Точки и зоны опасности:</span>
+              <span id="currentSlotOwner" class="text-blue-400 font-mono"></span>
+            </h3>
+            <span id="slotsCountBadge" class="bg-blue-950/80 text-blue-400 border border-blue-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold">0 / 5 точек</span>
+          </div>
+          <p class="text-xs text-gray-400 mt-0.5">Каждая точка имеет свои координаты и собственный радиус опасной зоны (Danger Zone)</p>
         </div>
-        <button onclick="document.getElementById('slotsSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl px-2">✕</button>
+        <div class="flex items-center gap-2 self-end sm:self-auto">
+          <button id="addSlotBtn" onclick="toggleAddSlotForm()" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3.5 py-1.5 rounded transition flex items-center gap-1.5 font-semibold shadow">
+            <span>➕ Добавить точку</span>
+          </button>
+          <button onclick="document.getElementById('slotsSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl px-2">✕</button>
+        </div>
       </div>
+
+      <!-- Карточка добавления новой точки -->
+      <div id="addSlotFormCard" class="hidden bg-gray-950 border border-emerald-800/60 p-4 rounded-lg mb-5 shadow-lg">
+        <div class="flex justify-between items-center mb-3 pb-2 border-b border-gray-800">
+          <div class="text-sm font-bold text-emerald-400 flex items-center gap-1.5">
+            <span>➕ Добавление новой точки</span>
+            <span class="text-xs font-normal text-gray-400 font-mono">(лимит: до 5 точек на ключ)</span>
+          </div>
+          <button onclick="toggleAddSlotForm(false)" class="text-gray-500 hover:text-white text-sm">✕</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div>
+            <label class="block text-[11px] font-semibold text-gray-400 mb-1">Название точки:</label>
+            <input id="newSlotName" type="text" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-sm text-white focus:border-emerald-500 focus:outline-none" placeholder="Дом, Офис, Дача, Склад...">
+          </div>
+          <div>
+            <label class="block text-[11px] font-semibold text-gray-400 mb-1">Широта (Latitude):</label>
+            <input id="newSlotLat" type="number" step="0.0001" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-sm text-white font-mono focus:border-emerald-500 focus:outline-none" placeholder="50.4501">
+          </div>
+          <div>
+            <label class="block text-[11px] font-semibold text-gray-400 mb-1">Долгота (Longitude):</label>
+            <input id="newSlotLon" type="number" step="0.0001" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-sm text-white font-mono focus:border-emerald-500 focus:outline-none" placeholder="30.5234">
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3 pt-3 border-t border-gray-900">
+          <div>
+            <div class="flex justify-between items-center text-xs text-gray-300 mb-1">
+              <span class="font-semibold">🚨 Опасная зона (Danger Zone):</span>
+              <span class="font-mono text-emerald-400 font-bold" id="newSlotDangerVal">35 км</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <input type="range" min="5" max="150" step="5" value="35" id="newSlotDangerRange" class="w-full accent-emerald-500 cursor-pointer" oninput="syncNewSlotDanger(this.value)">
+              <div class="flex items-center gap-1 shrink-0">
+                <input type="number" min="1" max="500" value="35" id="newSlotDangerNum" class="w-16 bg-gray-900 border border-gray-700 px-1.5 py-1 rounded text-xs text-white font-mono text-center" oninput="syncNewSlotDanger(this.value)">
+                <span class="text-[10px] text-gray-400">км</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <label class="block text-[11px] font-semibold text-gray-400 mb-1">Тип локации:</label>
+            <select id="newSlotType" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-xs text-white focus:border-emerald-500 focus:outline-none">
+              <option value="static">Статическая (постоянные координаты)</option>
+              <option value="dynamic">Динамическая (GPS координаты со смартфона / HA)</option>
+            </select>
+          </div>
+        </div>
+        <div class="mt-4 flex justify-end items-center gap-2">
+          <button onclick="toggleAddSlotForm(false)" class="px-3 py-1.5 text-xs text-gray-400 hover:text-white">Отмена</button>
+          <button onclick="submitNewSlot()" class="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-4 py-1.5 rounded text-xs transition shadow flex items-center gap-1">
+            <span>💾 Сохранить и добавить точку</span>
+          </button>
+        </div>
+      </div>
+
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="slotsCardsContainer"></div>
     </div>
   </div>
 
   <script>
-    let currentAdminKey = localStorage.getItem("hub_admin_key") || "";
-    if (currentAdminKey) document.getElementById("adminKeyInput").value = currentAdminKey;
+    let currentAdminKey = "";
     let cachedUsers = {};
     let currentEditApiKey = "";
+    let telemetryInterval = null;
+
+    function togglePasswordVisibility(inputId, iconId) {
+      const input = document.getElementById(inputId);
+      const icon = document.getElementById(iconId);
+      if (!input) return;
+      if (input.type === "password") {
+        input.type = "text";
+        if (icon) icon.innerText = "🙈";
+      } else {
+        input.type = "password";
+        if (icon) icon.innerText = "👁️";
+      }
+    }
+
+    function handleAddSlotLimit() {
+      alert("⚠️ Достигнут лимит точек (Limit reached)!\n\nДля каждого API-ключа разрешено максимум 5 локаций (слоты 1..5).\n\nЧтобы добавить новую локацию, сначала удалите одну из ненужных точек (иконка 🗑️ на карточке).");
+    }
+
+    function toggleAddSlotForm(show) {
+      const card = document.getElementById("addSlotFormCard");
+      if (!card) return;
+      if (show === undefined) {
+        card.classList.toggle("hidden");
+      } else if (show) {
+        card.classList.remove("hidden");
+      } else {
+        card.classList.add("hidden");
+      }
+      if (!card.classList.contains("hidden")) {
+        const inp = document.getElementById("newSlotName");
+        if (inp) inp.focus();
+      }
+    }
+
+    function syncNewSlotDanger(val) {
+      const r = document.getElementById("newSlotDangerRange");
+      const n = document.getElementById("newSlotDangerNum");
+      const l = document.getElementById("newSlotDangerVal");
+      if (r) r.value = val;
+      if (n) n.value = val;
+      if (l) l.innerText = val + " км";
+    }
+
+    async function verifyKeyOnServer(key) {
+      if (!key) return false;
+      try {
+        const res = await fetch("/api/v1/admin/verify?admin_key=" + encodeURIComponent(key));
+        return res.ok;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    async function handleLoginSubmit(event) {
+      if (event) event.preventDefault();
+      const input = document.getElementById("loginKeyInput");
+      const errBox = document.getElementById("loginError");
+      const btn = document.getElementById("loginBtn");
+      const key = input.value.trim();
+
+      if (!key) {
+        errBox.innerText = "❌ Пожалуйста, введите мастер-ключ админа";
+        errBox.classList.remove("hidden");
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = `<span class="animate-spin inline-block mr-2">⏳</span> Проверка ключа...`;
+      errBox.classList.add("hidden");
+
+      const ok = await verifyKeyOnServer(key);
+      btn.disabled = false;
+      btn.innerHTML = `<span>🔓 Войти в панель управления</span>`;
+
+      if (ok) {
+        currentAdminKey = key;
+        const remember = document.getElementById("rememberKeyCheck").checked;
+        if (remember) {
+          localStorage.setItem("hub_admin_key", key);
+        } else {
+          sessionStorage.setItem("hub_admin_key", key);
+          localStorage.removeItem("hub_admin_key");
+        }
+        showAdminApp();
+      } else {
+        errBox.innerText = "❌ Неверный мастер-ключ администратора! Проверьте переменную ADMIN_SECRET_KEY.";
+        errBox.classList.remove("hidden");
+        input.focus();
+        input.select();
+      }
+    }
+
+    function showAdminApp() {
+      document.getElementById("loginScreen").classList.add("hidden");
+      document.getElementById("adminApp").classList.remove("hidden");
+      updateTelemetry();
+      loadKeys();
+      if (!telemetryInterval) {
+        telemetryInterval = setInterval(updateTelemetry, 4000);
+      }
+    }
+
+    function showLoginScreen() {
+      if (telemetryInterval) {
+        clearInterval(telemetryInterval);
+        telemetryInterval = null;
+      }
+      document.getElementById("adminApp").classList.add("hidden");
+      document.getElementById("loginScreen").classList.remove("hidden");
+      document.getElementById("loginKeyInput").value = "";
+      document.getElementById("loginError").classList.add("hidden");
+      setTimeout(() => {
+        const inp = document.getElementById("loginKeyInput");
+        if (inp) inp.focus();
+      }, 100);
+    }
+
+    function handleLogout() {
+      localStorage.removeItem("hub_admin_key");
+      sessionStorage.removeItem("hub_admin_key");
+      currentAdminKey = "";
+      cachedUsers = {};
+      showLoginScreen();
+    }
+
+    async function initAuth() {
+      const savedKey = localStorage.getItem("hub_admin_key") || sessionStorage.getItem("hub_admin_key") || "";
+      if (savedKey) {
+        const ok = await verifyKeyOnServer(savedKey);
+        if (ok) {
+          currentAdminKey = savedKey;
+          showAdminApp();
+          return;
+        } else {
+          localStorage.removeItem("hub_admin_key");
+          sessionStorage.removeItem("hub_admin_key");
+        }
+      }
+      showLoginScreen();
+    }
 
     function syncDangerRadius(val) {
       document.getElementById("settingDangerRadiusRange").value = val;
@@ -1539,7 +2380,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     async function saveUserSettings() {
-      if (!currentEditApiKey) return;
+      if (!currentEditApiKey || !currentAdminKey) return;
       const radius = parseFloat(document.getElementById("settingDangerRadiusNum").value) || 35;
       const applyAll = document.getElementById("settingApplyToAllSlots") ? document.getElementById("settingApplyToAllSlots").checked : false;
       const payload = {
@@ -1558,7 +2399,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           body: JSON.stringify(payload)
         });
         if (res.ok) {
-          alert("Настройки успешно сохранены!");
+          alert("✅ Настройки успешно сохранены локально в базу данных!");
           document.getElementById("settingsSection").classList.add("hidden");
           loadKeys();
         } else {
@@ -1617,24 +2458,39 @@ ADMIN_HTML = """<!DOCTYPE html>
           pBadge.innerText = "DIRECT";
           pBadge.className = "bg-blue-950 text-blue-400 border border-blue-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
         }
+
+        // Unknown target types banner
+        const unkBanner = document.getElementById("unknownTypesBanner");
+        const unkText = document.getElementById("unknownTypesText");
+        if (unkBanner && unkText) {
+          if (hData.unknown_target_types_count > 0) {
+            const listStr = hData.unknown_target_types.map(x => `${x.type_identifier} (код: ${x.raw_code}, повторень: ${x.count})`).join(", ");
+            unkText.innerHTML = `<b>Увага: виявлено новий невідомий тип цілі в ефірі:</b> ${listStr}. Ціль автоматично супроводжується як <i>"Ціль не визначена"</i> із збереженням усіх алерів та координат.`;
+            unkBanner.classList.remove("hidden");
+          } else {
+            unkBanner.classList.add("hidden");
+          }
+        }
       } catch(e) {}
     }
 
     async function loadKeys() {
-      const key = document.getElementById("adminKeyInput").value.trim();
-      if (!key) return alert("Введите мастер-ключ админа");
-      currentAdminKey = key;
-      localStorage.setItem("hub_admin_key", key);
+      if (!currentAdminKey) return showLoginScreen();
 
       updateTelemetry();
 
       try {
-        const res = await fetch("/api/v1/admin/keys?admin_key=" + encodeURIComponent(key));
-        if (res.status === 403) return alert("Неверный мастер-ключ админа!");
+        const res = await fetch("/api/v1/admin/keys?admin_key=" + encodeURIComponent(currentAdminKey));
+        if (res.status === 403) {
+          alert("Сессия администратора истекла или ключ неверен!");
+          return handleLogout();
+        }
         const data = await res.json();
         document.getElementById("statKeysCount").innerText = data.users.length;
         renderKeysTable(data.users);
-      } catch(e) { alert("Ошибка загрузки: " + e); }
+      } catch(e) { 
+        alert("Ошибка загрузки списка ключей: " + e); 
+      }
     }
 
     function renderKeysTable(users) {
@@ -1649,7 +2505,7 @@ ADMIN_HTML = """<!DOCTYPE html>
               <div class="text-3xl mb-2">📭</div>
               <div class="font-semibold text-white text-base">Нет созданных API-ключей</div>
               <p class="text-xs text-gray-500 mt-1 max-w-md mx-auto">
-                База данных чистая. Нажмите кнопку <span class="text-emerald-400 font-semibold">«+ Создать ключ»</span> выше, чтобы добавить первый API-ключ для ESP32 или Home Assistant.
+                База данных пустая. Нажмите кнопку <span class="text-emerald-400 font-semibold">«+ Создать ключ»</span> выше, чтобы добавить первый API-ключ для ESP32 или Home Assistant.
               </p>
             </td>
           </tr>
@@ -1664,6 +2520,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 
         // Генерируем компактные плашки с радиусом опасной зоны для каждого слота отдельно
         const slotsObj = u.slots || {};
+        const slotsCount = Object.keys(slotsObj).length;
         const slotsBadges = Object.keys(slotsObj).sort().map(sid => {
           const sl = slotsObj[sid];
           const rad = sl.danger_radius_km ?? s.danger_radius_km ?? 35;
@@ -1674,6 +2531,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           </span>`;
         }).join(" ");
 
+        const safeOwner = (u.owner || 'Пользователь').replace(/'/g, "\\'");
         const tr = document.createElement("tr");
         tr.className = "hover:bg-gray-800/50 transition";
         tr.innerHTML = `
@@ -1689,7 +2547,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           <td class="p-3">
             <div class="text-[11px] text-gray-300 font-semibold mb-1">Зоны опасности (по точкам):</div>
             <div class="flex flex-wrap gap-1 mb-2">
-              ${slotsBadges || '<span class="text-xs text-gray-500">Нет слотов</span>'}
+              ${slotsCount > 0 ? slotsBadges : '<span class="text-xs text-gray-500 italic">Точки не добавлены (0/5)</span>'}
             </div>
             <div class="text-[11px] text-gray-400 flex flex-wrap gap-1">
               ${s.alert_threat ? '<span class="bg-red-950/80 text-red-400 border border-red-900/60 px-1.5 py-0.5 rounded">🎯 Цели</span>' : '<span class="bg-gray-900 text-gray-600 line-through px-1.5 py-0.5 rounded">🎯 Цели</span>'}
@@ -1700,7 +2558,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           </td>
           <td class="p-3 text-xs text-gray-400">${lastSeen}</td>
           <td class="p-3 text-right space-x-1.5 whitespace-nowrap">
-            <button onclick="editUserSlots('${u.api_key}', '${u.owner}')" class="bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1 rounded text-xs font-semibold transition" title="Настроить координаты и радиус опасной зоны для каждого из 5 слотов">📍 Точки & Зоны (5)</button>
+            <button onclick="editUserSlots('${u.api_key}', '${safeOwner}')" class="bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1 rounded text-xs font-semibold transition" title="Настроить локации и зоны опасности">📍 Точки (${slotsCount}/5)</button>
             <button onclick="openUserSettings('${u.api_key}')" class="bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded text-xs font-semibold transition" title="Настроить типы звуковых алертов">🔔 Алерты</button>
             <button onclick="toggleKey('${u.api_key}', ${!u.enabled})" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-2 py-1 rounded text-xs transition">${u.enabled ? 'Выкл' : 'Вкл'}</button>
             <button onclick="deleteKey('${u.api_key}')" class="text-red-400 hover:text-red-300 px-2 py-1 text-xs transition">Удалить</button>
@@ -1711,6 +2569,8 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     async function editUserSlots(apiKey, owner) {
+      if (!currentAdminKey) return showLoginScreen();
+      currentEditApiKey = apiKey;
       const res = await fetch("/api/v1/slots?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey));
       if (!res.ok) return alert("Ошибка чтения слотов пользователя");
       const data = await res.json();
@@ -1718,67 +2578,116 @@ ADMIN_HTML = """<!DOCTYPE html>
       document.getElementById("settingsSection").classList.add("hidden");
       document.getElementById("slotsSection").classList.remove("hidden");
       document.getElementById("currentSlotOwner").innerText = owner;
+      toggleAddSlotForm(false);
+
+      const slotsKeys = Object.keys(data.slots || {}).sort();
+      const slotsCount = slotsKeys.length;
+      const badge = document.getElementById("slotsCountBadge");
+      const addBtn = document.getElementById("addSlotBtn");
+
+      if (slotsCount >= 5) {
+        if (badge) {
+          badge.className = "bg-amber-950/80 text-amber-400 border border-amber-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
+          badge.innerText = "5 / 5 точек (Лимит исчерпан)";
+        }
+        if (addBtn) {
+          addBtn.className = "bg-gray-800 text-gray-500 border border-gray-700 text-xs px-3.5 py-1.5 rounded flex items-center gap-1.5 font-semibold cursor-not-allowed";
+          addBtn.title = "Достигнут лимит 5 точек. Удалите одну точку, чтобы добавить новую.";
+          addBtn.onclick = handleAddSlotLimit;
+        }
+      } else {
+        if (badge) {
+          badge.className = "bg-blue-950/80 text-blue-400 border border-blue-800 text-xs px-2.5 py-0.5 rounded font-mono font-bold";
+          badge.innerText = `${slotsCount} / 5 точек`;
+        }
+        if (addBtn) {
+          addBtn.className = "bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3.5 py-1.5 rounded transition flex items-center gap-1.5 font-semibold shadow";
+          addBtn.title = "Добавить новую точку (до 5)";
+          addBtn.onclick = () => toggleAddSlotForm();
+        }
+      }
+
       const container = document.getElementById("slotsCardsContainer");
       container.innerHTML = "";
 
-      Object.keys(data.slots).sort().forEach(slotId => {
-        const s = data.slots[slotId];
-        const isDyn = s.type === "dynamic";
-        const dangerRadius = s.danger_radius_km ?? 35;
-        const card = document.createElement("div");
-        card.className = "bg-gray-950 border border-gray-800 p-4 rounded-lg space-y-3";
-        card.innerHTML = `
-          <div class="flex justify-between items-center pb-2 border-b border-gray-800/80">
-            <div class="flex items-center gap-2">
-              <span class="w-6 h-6 rounded-full bg-blue-900/60 text-blue-300 flex items-center justify-center text-xs font-bold font-mono">#${slotId}</span>
-              <span class="text-sm font-bold text-white">${s.name || ('Слот #' + slotId)}</span>
-            </div>
-            <span class="text-[10px] px-2 py-0.5 rounded font-mono font-medium ${isDyn ? 'bg-purple-900/60 text-purple-300 border border-purple-800' : 'bg-blue-900/60 text-blue-300 border border-blue-800'}">${isDyn ? 'GPS ДИНАМИЧЕСКИЙ' : 'СТАТИЧЕСКИЙ'}</span>
-          </div>
-
-          <div class="space-y-2">
-            <div>
-              <label class="block text-[11px] font-semibold text-gray-400 mb-1">Название точки:</label>
-              <input id="name_${slotId}" type="text" value="${s.name}" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-sm text-white focus:border-blue-500 focus:outline-none" placeholder="Дом, Работа, Дача...">
-            </div>
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="block text-[11px] font-semibold text-gray-400 mb-1">Широта (Lat):</label>
-                <input id="lat_${slotId}" type="number" step="0.0001" value="${s.lat}" class="w-full bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white font-mono" placeholder="50.4501">
-              </div>
-              <div>
-                <label class="block text-[11px] font-semibold text-gray-400 mb-1">Долгота (Lon):</label>
-                <input id="lon_${slotId}" type="number" step="0.0001" value="${s.lon}" class="w-full bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white font-mono" placeholder="30.5234">
-              </div>
-            </div>
-
-            <div class="pt-2 border-t border-gray-900">
-              <div class="flex justify-between items-center text-xs text-gray-300 mb-1">
-                <span class="font-semibold flex items-center gap-1">🚨 Опасная зона (Danger Zone):</span>
-                <span class="font-mono text-emerald-400 font-bold" id="danger_val_${slotId}">${dangerRadius} км</span>
-              </div>
-              <div class="flex items-center gap-2">
-                <input type="range" min="5" max="150" step="5" value="${dangerRadius}" id="danger_range_${slotId}" class="w-full accent-emerald-500 cursor-pointer" oninput="syncSlotDanger('${slotId}', this.value)">
-                <div class="flex items-center gap-1 shrink-0">
-                  <input type="number" min="1" max="500" value="${dangerRadius}" id="danger_num_${slotId}" class="w-16 bg-gray-900 border border-gray-700 px-1.5 py-1 rounded text-xs text-white font-mono text-center" oninput="syncSlotDanger('${slotId}', this.value)">
-                  <span class="text-[10px] text-gray-400">км</span>
-                </div>
-              </div>
-              <p class="text-[10px] text-gray-500 mt-1">Персональный радиус подлёта цели к этой точке</p>
-            </div>
-
-            <button onclick="saveSlot('${apiKey}', '${slotId}')" class="w-full bg-blue-600/80 hover:bg-blue-600 text-white py-1.5 rounded text-xs font-semibold mt-2 transition shadow flex items-center justify-center gap-1">
-              💾 Сохранить точку #${slotId}
+      if (slotsCount === 0) {
+        container.innerHTML = `
+          <div class="col-span-full bg-gray-950 border border-dashed border-gray-800 p-8 rounded-lg text-center">
+            <div class="text-3xl mb-2">📍</div>
+            <div class="text-white font-semibold text-sm">Точки ещё не добавлены (0 / 5)</div>
+            <p class="text-xs text-gray-500 mt-1 max-w-md mx-auto mb-4">
+              У этого пользователя пока нет настроенных точек. Вы можете по очереди добавить до 5 локаций (например: Дом, Работа, Родители, GPS со смартфона).
+            </p>
+            <button onclick="toggleAddSlotForm(true)" class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded text-xs font-semibold shadow transition inline-flex items-center gap-1.5">
+              <span>➕ Добавить первую точку</span>
             </button>
           </div>
         `;
-        container.appendChild(card);
-      });
+      } else {
+        slotsKeys.forEach(slotId => {
+          const s = data.slots[slotId];
+          const isDyn = s.type === "dynamic";
+          const dangerRadius = s.danger_radius_km ?? 35;
+          const safeName = (s.name || ('Точка #' + slotId)).replace(/'/g, "\\'");
+          const card = document.createElement("div");
+          card.className = "bg-gray-950 border border-gray-800 p-4 rounded-lg space-y-3";
+          card.innerHTML = `
+            <div class="flex justify-between items-center pb-2 border-b border-gray-800/80">
+              <div class="flex items-center gap-2">
+                <span class="w-6 h-6 rounded-full bg-blue-900/60 text-blue-300 flex items-center justify-center text-xs font-bold font-mono">#${slotId}</span>
+                <span class="text-sm font-bold text-white">${s.name || ('Слот #' + slotId)}</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="text-[10px] px-2 py-0.5 rounded font-mono font-medium ${isDyn ? 'bg-purple-900/60 text-purple-300 border border-purple-800' : 'bg-blue-900/60 text-blue-300 border border-blue-800'}">${isDyn ? 'GPS ДИНАМИЧЕСКИЙ' : 'СТАТИЧЕСКИЙ'}</span>
+                <button onclick="deleteSlot('${apiKey}', '${slotId}', '${safeName}')" class="text-red-400 hover:text-red-200 hover:bg-red-950/80 px-1.5 py-0.5 rounded transition text-xs font-bold" title="Удалить эту точку">🗑️</button>
+              </div>
+            </div>
+
+            <div class="space-y-2">
+              <div>
+                <label class="block text-[11px] font-semibold text-gray-400 mb-1">Название точки:</label>
+                <input id="name_${slotId}" type="text" value="${s.name || ''}" class="w-full bg-gray-900 border border-gray-700 px-2.5 py-1.5 rounded text-sm text-white focus:border-blue-500 focus:outline-none" placeholder="Дом, Работа, Дача...">
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-[11px] font-semibold text-gray-400 mb-1">Широта (Lat):</label>
+                  <input id="lat_${slotId}" type="number" step="0.0001" value="${s.lat}" class="w-full bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white font-mono" placeholder="50.4501">
+                </div>
+                <div>
+                  <label class="block text-[11px] font-semibold text-gray-400 mb-1">Долгота (Lon):</label>
+                  <input id="lon_${slotId}" type="number" step="0.0001" value="${s.lon}" class="w-full bg-gray-900 border border-gray-700 px-2 py-1 rounded text-xs text-white font-mono" placeholder="30.5234">
+                </div>
+              </div>
+
+              <div class="pt-2 border-t border-gray-900">
+                <div class="flex justify-between items-center text-xs text-gray-300 mb-1">
+                  <span class="font-semibold flex items-center gap-1">🚨 Опасная зона (Danger Zone):</span>
+                  <span class="font-mono text-emerald-400 font-bold" id="danger_val_${slotId}">${dangerRadius} км</span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <input type="range" min="5" max="150" step="5" value="${dangerRadius}" id="danger_range_${slotId}" class="w-full accent-emerald-500 cursor-pointer" oninput="syncSlotDanger('${slotId}', this.value)">
+                  <div class="flex items-center gap-1 shrink-0">
+                    <input type="number" min="1" max="500" value="${dangerRadius}" id="danger_num_${slotId}" class="w-16 bg-gray-900 border border-gray-700 px-1.5 py-1 rounded text-xs text-white font-mono text-center" oninput="syncSlotDanger('${slotId}', this.value)">
+                    <span class="text-[10px] text-gray-400">км</span>
+                  </div>
+                </div>
+                <p class="text-[10px] text-gray-500 mt-1">Персональный радиус подлёта цели к этой точке</p>
+              </div>
+
+              <button onclick="saveSlot('${apiKey}', '${slotId}')" class="w-full bg-blue-600/80 hover:bg-blue-600 text-white py-1.5 rounded text-xs font-semibold mt-2 transition shadow flex items-center justify-center gap-1">
+                💾 Сохранить точку #${slotId}
+              </button>
+            </div>
+          `;
+          container.appendChild(card);
+        });
+      }
 
       document.getElementById("slotsSection").scrollIntoView({ behavior: "smooth" });
     }
 
     async function saveSlot(apiKey, slotId) {
+      if (!currentAdminKey) return showLoginScreen();
       const name = document.getElementById("name_" + slotId).value;
       const lat = parseFloat(document.getElementById("lat_" + slotId).value);
       const lon = parseFloat(document.getElementById("lon_" + slotId).value);
@@ -1791,7 +2700,96 @@ ADMIN_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ name, lat, lon, danger_radius_km })
         });
         if (res.ok) {
-          alert("Точка #" + slotId + " (" + name + ") с радиусом " + danger_radius_km + " км успешно сохранена!");
+          alert("✅ Точка #" + slotId + " (" + name + ") с радиусом " + danger_radius_km + " км успешно сохранена на диск!");
+          loadKeys();
+        } else {
+          const err = await res.json();
+          alert("Ошибка сохранения: " + (err.error || "Неизвестная ошибка"));
+        }
+      } catch (e) {
+        alert("Ошибка сети: " + e);
+      }
+    }
+
+    async function submitNewSlot() {
+      if (!currentEditApiKey || !currentAdminKey) return;
+      const name = document.getElementById("newSlotName").value.trim();
+      const latStr = document.getElementById("newSlotLat").value.trim();
+      const lonStr = document.getElementById("newSlotLon").value.trim();
+      const dangerRadius = parseFloat(document.getElementById("newSlotDangerNum").value) || 35;
+      const slotType = document.getElementById("newSlotType").value || "static";
+
+      if (!latStr || !lonStr) {
+        alert("❌ Пожалуйста, введите широту (Lat) и долготу (Lon) точки!");
+        return;
+      }
+      const lat = parseFloat(latStr);
+      const lon = parseFloat(lonStr);
+      if (isNaN(lat) || isNaN(lon)) {
+        alert("❌ Координаты должны быть валидными числами (например: 50.4501, 30.5234)!");
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/v1/slots?token=" + encodeURIComponent(currentEditApiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: name || undefined,
+            lat: lat,
+            lon: lon,
+            danger_radius_km: dangerRadius,
+            type: slotType
+          })
+        });
+        const resp = await res.json();
+        if (res.ok && resp.status === "success") {
+          alert("✅ Точка «" + (resp.slot.name || ("#" + resp.slot.id)) + "» успешно добавлена!");
+          toggleAddSlotForm(false);
+          document.getElementById("newSlotName").value = "";
+          document.getElementById("newSlotLat").value = "";
+          document.getElementById("newSlotLon").value = "";
+          const user = cachedUsers[currentEditApiKey];
+          editUserSlots(currentEditApiKey, user ? user.owner : "Пользователь");
+          loadKeys();
+        } else {
+          alert("❌ Ошибка добавления точки: " + (resp.message || resp.error || "Неизвестная ошибка"));
+        }
+      } catch (e) {
+        alert("❌ Ошибка сети: " + e);
+      }
+    }
+
+    async function deleteSlot(apiKey, slotId, slotName) {
+      if (!currentAdminKey) return showLoginScreen();
+      if (!confirm("Вы действительно хотите удалить точку #" + slotId + " («" + slotName + "»)?")) return;
+
+      try {
+        const res = await fetch("/api/v1/slots/" + encodeURIComponent(slotId) + "?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "DELETE"
+        });
+        const resp = await res.json();
+        if (res.ok && resp.status === "deleted") {
+          alert("✅ Точка #" + slotId + " успешно удалена!");
+          const user = cachedUsers[apiKey];
+          editUserSlots(apiKey, user ? user.owner : "Пользователь");
+          loadKeys();
+        } else {
+          alert("❌ Ошибка удаления точки: " + (resp.error || "Неизвестная ошибка"));
+        }
+      } catch (e) {
+        alert("❌ Ошибка сети: " + e);
+      }
+    }
+
+      try {
+        const res = await fetch("/api/v1/slots/" + slotId + "?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, lat, lon, danger_radius_km })
+        });
+        if (res.ok) {
+          alert("✅ Точка #" + slotId + " (" + name + ") с радиусом " + danger_radius_km + " км успешно сохранена на диск!");
           loadKeys();
         } else {
           const err = await res.json();
@@ -1803,6 +2801,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     async function toggleKey(key, enabled) {
+      if (!currentAdminKey) return showLoginScreen();
       await fetch("/api/v1/admin/keys/" + encodeURIComponent(key) + "?admin_key=" + encodeURIComponent(currentAdminKey), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -1812,6 +2811,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     async function deleteKey(key) {
+      if (!currentAdminKey) return showLoginScreen();
       if (!confirm("Вы уверены, что хотите отозвать этот API-ключ?")) return;
       await fetch("/api/v1/admin/keys/" + encodeURIComponent(key) + "?admin_key=" + encodeURIComponent(currentAdminKey), {
         method: "DELETE"
@@ -1820,25 +2820,36 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
     async function openCreateModal() {
-      const owner = prompt("Введите имя владельца (например: 'Жена (Анна)', 'Сын'):");
-      if (!owner) return;
-      await fetch("/api/v1/admin/keys?admin_key=" + encodeURIComponent(currentAdminKey), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ owner })
-      });
-      loadKeys();
+      if (!currentAdminKey) return showLoginScreen();
+      const owner = prompt("Введите имя владельца (например: 'Жена (Анна)', 'Сын', 'Домашний ESP32'):");
+      if (!owner || !owner.trim()) return;
+      try {
+        const res = await fetch("/api/v1/admin/keys?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ owner: owner.trim() })
+        });
+        if (res.ok) {
+          alert("✅ Ключ для '" + owner.trim() + "' успешно создан и сохранён на диск!");
+          loadKeys();
+        } else {
+          const err = await res.json().catch(() => ({}));
+          alert("❌ Ошибка создания ключа: " + (err.error || "Не авторизован"));
+        }
+      } catch (e) {
+        alert("Ошибка сети: " + e);
+      }
     }
 
     function downloadBackup() {
-      if (!currentAdminKey) return alert("Сначала введите мастер-ключ админа");
+      if (!currentAdminKey) return showLoginScreen();
       window.location.href = "/api/v1/admin/backup?admin_key=" + encodeURIComponent(currentAdminKey);
     }
 
     async function uploadBackup(event) {
       const file = event.target.files[0];
       if (!file) return;
-      if (!currentAdminKey) return alert("Сначала введите мастер-ключ админа");
+      if (!currentAdminKey) return showLoginScreen();
       try {
         const text = await file.text();
         const json = JSON.parse(text);
@@ -1849,10 +2860,10 @@ ADMIN_HTML = """<!DOCTYPE html>
         });
         const resp = await res.json();
         if (resp.status === "success") {
-          alert("Бэкап успешно восстановлен! Загружено ключей: " + resp.users_count);
+          alert("✅ Бэкап успешно восстановлен! Загружено ключей: " + resp.users_count);
           loadKeys();
         } else {
-          alert("Ошибка восстановления: " + (resp.error || "Неизвестная ошибка"));
+          alert("❌ Ошибка восстановления: " + (resp.error || "Неизвестная ошибка"));
         }
       } catch (e) {
         alert("Ошибка чтения файла: " + e);
@@ -1860,9 +2871,8 @@ ADMIN_HTML = """<!DOCTYPE html>
       event.target.value = "";
     }
 
-    updateTelemetry();
-    setInterval(updateTelemetry, 4000);
-    if (currentAdminKey) loadKeys();
+    // Инициализация авторизации при загрузке страницы
+    initAuth();
   </script>
 </body>
 </html>
@@ -1905,20 +2915,32 @@ def create_app() -> web.Application:
         "mig31k_active": state.mig_active,
         "upstream_provider": state.upstream_provider,
         "upstream_name": "Основной (WebSocket map.ukrainealarm.com)" if state.upstream_provider == "ukrainealarm" else ("Резервный (REST neptun.in.ua)" if state.upstream_provider == "neptun_failover" else "Ожидание подключения"),
+        "unknown_target_types_count": len(UNKNOWN_TARGET_TYPES_CATALOG),
+        "unknown_target_types": list(UNKNOWN_TARGET_TYPES_CATALOG.values()),
         "proxy_enabled": bool(UPSTREAM_PROXY),
         "proxy_info": mask_proxy(UPSTREAM_PROXY)
     }))
+    app.router.add_get("/api/v1/unknown_types", lambda r: web.json_response({
+        "status": "ok",
+        "count": len(UNKNOWN_TARGET_TYPES_CATALOG),
+        "catalog": list(UNKNOWN_TARGET_TYPES_CATALOG.values())
+    }))
     app.router.add_get("/api/v1/slots", handle_get_slots)
+    app.router.add_post("/api/v1/slots", handle_create_slot)
     app.router.add_put("/api/v1/slots/{slot_id}", handle_update_slot)
+    app.router.add_delete("/api/v1/slots/{slot_id}", handle_delete_slot)
     app.router.add_post("/api/v1/locations/dynamic", handle_update_dynamic)
     app.router.add_get("/api/v1/settings", handle_get_settings)
     app.router.add_put("/api/v1/settings", handle_update_settings)
     app.router.add_post("/api/v1/settings", handle_update_settings)
     app.router.add_get("/api/v1/threats", handle_get_threats)
     app.router.add_get("/api/v1/radar", handle_get_radar)
+    app.router.add_get("/api/v1/map", handle_get_map)
     app.router.add_get("/api/v1/stream", handle_websocket_stream)
 
     app.router.add_get("/admin", handle_admin_dashboard)
+    app.router.add_get("/api/v1/admin/verify", handle_admin_verify)
+    app.router.add_post("/api/v1/admin/verify", handle_admin_verify)
     app.router.add_get("/api/v1/admin/keys", handle_admin_get_keys)
     app.router.add_post("/api/v1/admin/keys", handle_admin_create_key)
     app.router.add_put("/api/v1/admin/keys/{key}", handle_admin_update_key)
