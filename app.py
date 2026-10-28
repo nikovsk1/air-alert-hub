@@ -600,17 +600,76 @@ class TargetTrack:
 # =====================================================================
 
 class HistoryManager:
-    """Збереження та надання історії польотів за місяцями та днями."""
+    """Збереження та надання історії польотів за місяцями та днями (з підтримкою вимкнення та Google Drive)."""
     def __init__(self, data_dir: str):
         self.history_dir = os.path.join(data_dir, "history")
         os.makedirs(self.history_dir, exist_ok=True)
+        self.config_path = os.path.join(self.history_dir, "config.json")
+        self.config = {
+            "enabled": True,
+            "gdrive_url": "",
+            "gdrive_webhook": "",
+            "gdrive_sync_hours": 0,
+            "last_gdrive_sync_ts": 0
+        }
+        self.load_config()
         self.active_tracks = {} # tid -> entry
         self.dirty_months = set()
         self.last_flush_ts = time.time()
         self.flush_interval = 300.0 # 5 хвилин між скиданнями на диск для збереження ресурсу SD-карти
         self._cache = {} # month_str -> full dict
 
+    def load_config(self):
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    self.config.update(json.load(f))
+            except Exception as e:
+                logger.error(f"Error loading history config: {e}")
+        else:
+            self.save_config()
+
+    def save_config(self):
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Error saving history config: {e}")
+
+    def is_enabled(self) -> bool:
+        return bool(self.config.get("enabled", True))
+
+    async def sync_to_gdrive(self, month_str):
+        webhook_url = self.config.get("gdrive_webhook", "").strip()
+        if not webhook_url:
+            return False, "Google Apps Script Webhook URL не налаштовано!"
+        d = self._load_month_data(month_str)
+        payload = {
+            "filename": f"flight_history_{month_str}.json",
+            "month": month_str,
+            "total_targets": d.get("total_targets", 0),
+            "content": d
+        }
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json", "User-Agent": "AirAlertHub/1.0"},
+                method="POST"
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=30))
+            self.config["last_gdrive_sync_ts"] = int(time.time())
+            self.save_config()
+            return True, "Файл успішно передано на Google Диск!"
+        except Exception as e:
+            logger.error(f"Error syncing history to Google Drive: {e}")
+            return False, str(e)
+
     def update_point(self, trk):
+        if not self.is_enabled():
+            return
         now = time.time()
         tid = trk.id
         dt_str = time.strftime("%Y-%m-%d", time.gmtime(trk.first_seen))
@@ -647,6 +706,9 @@ class HistoryManager:
         self.dirty_months.add(month_str)
 
     def finish_track(self, trk, status="lost"):
+        if not self.is_enabled():
+            if trk.id in self.active_tracks: del self.active_tracks[trk.id]
+            return
         tid = trk.id
         now = time.time()
         if tid in self.active_tracks:
@@ -690,6 +752,8 @@ class HistoryManager:
         return new_d
 
     def flush_to_disk(self, force=False):
+        if not self.is_enabled():
+            return
         now = time.time()
         if not force and (now - self.last_flush_ts) < self.flush_interval:
             return
@@ -746,6 +810,89 @@ class HistoryManager:
             "targets": filtered
         }
 
+    async def fetch_month_from_gdrive(self, month_str):
+        webhook_url = self.config.get("gdrive_webhook", "").strip()
+        if not webhook_url:
+            return None
+        import urllib.parse
+        import urllib.request
+        url = f"{webhook_url}?action=get&month={urllib.parse.quote(month_str)}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "AirAlertHub/1.0"},
+                method="GET"
+            )
+            loop = asyncio.get_running_loop()
+            def _fetch():
+                with urllib.request.urlopen(req, timeout=40) as resp:
+                    return resp.read().decode("utf-8")
+            raw_text = await loop.run_in_executor(None, _fetch)
+            data = json.loads(raw_text)
+            if isinstance(data, dict) and data.get("status") == "error":
+                logger.warning(f"☁️ [HistoryManager] Google Диск повернув помилку: {data.get('message')}")
+                return None
+            if isinstance(data, dict) and ("targets" in data or "dates" in data):
+                filepath = os.path.join(self.history_dir, f"flight_history_{month_str}.json")
+                tmp_path = filepath + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
+                os.replace(tmp_path, filepath)
+                self._cache[month_str] = data
+                logger.info(f"☁️ [HistoryManager] Успішно завантажено архів {month_str} з Google Диску ({len(data.get('targets', {}))} цілей) та збережено на пристрій.")
+                return data
+        except Exception as e:
+            logger.error(f"Error fetching {month_str} from Google Drive: {e}")
+        return None
+
+    async def fetch_gdrive_months_list(self):
+        webhook_url = self.config.get("gdrive_webhook", "").strip()
+        if not webhook_url:
+            return []
+        now = time.time()
+        if hasattr(self, "_gdrive_months_cache") and (now - self._gdrive_months_cache.get("ts", 0)) < 120:
+            return self._gdrive_months_cache.get("months", [])
+        
+        import urllib.request
+        url = f"{webhook_url}?action=list"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "AirAlertHub/1.0"},
+                method="GET"
+            )
+            loop = asyncio.get_running_loop()
+            def _fetch():
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    return resp.read().decode("utf-8")
+            raw_text = await loop.run_in_executor(None, _fetch)
+            res = json.loads(raw_text)
+            if res.get("status") == "ok" and isinstance(res.get("months"), list):
+                self._gdrive_months_cache = {"ts": now, "months": res["months"]}
+                return res["months"]
+        except Exception as e:
+            logger.debug(f"Could not fetch months list from Google Drive: {e}")
+        return getattr(self, "_gdrive_months_cache", {}).get("months", [])
+
+    async def get_available_months_combined(self):
+        months_dict = self.get_available_months()
+        sources = {m: "local" for m in months_dict.keys()}
+        gdrive_months = await self.fetch_gdrive_months_list()
+        for gm in gdrive_months:
+            if gm not in months_dict:
+                months_dict[gm] = []
+                sources[gm] = "gdrive"
+            else:
+                sources[gm] = "both"
+        return months_dict, sources
+
+    async def get_history_async(self, month_str, date_str=None):
+        filepath = os.path.join(self.history_dir, f"flight_history_{month_str}.json")
+        if month_str not in self._cache and not os.path.exists(filepath):
+            logger.info(f"☁️ [HistoryManager] Файл {month_str} відсутній на пристрої. Запит до Google Диску...")
+            await self.fetch_month_from_gdrive(month_str)
+        return self.get_history(month_str, date_str=date_str)
+
     def import_external_history(self, raw_data: dict) -> int:
         items = raw_data.values() if isinstance(raw_data, dict) else raw_data
         count = 0
@@ -792,14 +939,16 @@ class HistoryManager:
         self.flush_to_disk(force=True)
         return count
 
-    def get_admin_summary(self):
+    async def get_admin_summary(self):
         files_list = []
         total_sz = 0
         total_targets = 0
+        local_months = set()
         if os.path.exists(self.history_dir):
             for fn in sorted(os.listdir(self.history_dir), reverse=True):
                 if fn.startswith("flight_history_") and fn.endswith(".json"):
                     m_str = fn.replace("flight_history_", "").replace(".json", "")
+                    local_months.add(m_str)
                     fp = os.path.join(self.history_dir, fn)
                     sz = os.path.getsize(fp)
                     total_sz += sz
@@ -813,8 +962,33 @@ class HistoryManager:
                         "size_kb": round(sz / 1024, 1),
                         "total_targets": t_count,
                         "dates": d.get("dates", []),
-                        "updated_at": d.get("updated_at", int(os.path.getmtime(fp)))
+                        "updated_at": d.get("updated_at", int(os.path.getmtime(fp))),
+                        "is_local": True,
+                        "on_gdrive": False
                     })
+        
+        # Перевірка наявності на Google Диску
+        gdrive_months = await self.fetch_gdrive_months_list()
+        for f in files_list:
+            if f["month"] in gdrive_months:
+                f["on_gdrive"] = True
+
+        for gm in gdrive_months:
+            if gm not in local_months:
+                files_list.append({
+                    "filename": f"flight_history_{gm}.json",
+                    "month": gm,
+                    "size_bytes": 0,
+                    "size_kb": "--",
+                    "total_targets": "--",
+                    "dates": ["Хмара Google Диск"],
+                    "updated_at": None,
+                    "is_local": False,
+                    "on_gdrive": True
+                })
+
+        files_list.sort(key=lambda x: x["month"], reverse=True)
+
         return {
             "total_size_bytes": total_sz,
             "total_size_mb": f"{total_sz / (1024 * 1024):.2f} MB",
@@ -2137,11 +2311,57 @@ async def handle_admin_delete_key(request: web.Request):
 # ADMIN HISTORY API ENDPOINTS
 # =====================================================================
 
+
+async def handle_admin_get_history_config(request: web.Request):
+    """Отримання налаштувань запису історії та Google Drive."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    return web.json_response({"status": "ok", "config": history_manager.config})
+
+async def handle_admin_set_history_config(request: web.Request):
+    """Оновлення налаштувань запису історії (вкл/викл, посилання на Google Drive)."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    try:
+        data = await request.json()
+        if "enabled" in data:
+            history_manager.config["enabled"] = bool(data["enabled"])
+            if not history_manager.config["enabled"]:
+                history_manager.active_tracks.clear()
+                history_manager.dirty_months.clear()
+        if "gdrive_url" in data:
+            history_manager.config["gdrive_url"] = str(data["gdrive_url"]).strip()
+        if "gdrive_webhook" in data:
+            history_manager.config["gdrive_webhook"] = str(data["gdrive_webhook"]).strip()
+        if "gdrive_sync_hours" in data:
+            try:
+                history_manager.config["gdrive_sync_hours"] = max(0, int(data["gdrive_sync_hours"]))
+            except (ValueError, TypeError):
+                pass
+        history_manager.save_config()
+        return web.json_response({"status": "ok", "config": history_manager.config})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+async def handle_admin_sync_gdrive(request: web.Request):
+    """Експорт помісячного файлу на Google Диск через Webhook."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    month_id = request.match_info.get("month")
+    ok, msg = await history_manager.sync_to_gdrive(month_id)
+    return web.json_response({"status": "ok" if ok else "error", "message": msg})
+
 async def handle_admin_get_history(request: web.Request):
     """Список файлов истории, размер и количество целей для админки."""
     if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
-    summary = history_manager.get_admin_summary()
+    summary = await history_manager.get_admin_summary()
     return web.json_response(summary)
+
+async def handle_admin_restore_gdrive(request: web.Request):
+    """Відновлення файлу історії з Google Диску на пристрій."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    month_id = request.match_info.get("month")
+    data = await history_manager.fetch_month_from_gdrive(month_id)
+    if data:
+        return web.json_response({"status": "ok", "message": f"Архів за {month_id} успішно завантажено на пристрій!"})
+    return web.json_response({"status": "error", "message": f"Не вдалося завантажити {month_id} з Google Диску"}, status=400)
 
 async def handle_admin_delete_history(request: web.Request):
     """Удаление помесячного файла истории."""
@@ -2363,12 +2583,45 @@ ADMIN_HTML = """<!DOCTYPE html>
             <span>📁 Архів історії польотів (Flight History)</span>
             <span id="histTotalBadge" class="text-xs bg-sky-950 text-sky-400 border border-sky-800 px-2 py-0.5 rounded-full font-mono">0 МБ</span>
           </h2>
-          <p class="text-xs text-gray-400 mt-0.5">Помісячне збереження траєкторій цілей, оптимізація під SD-карту та керування архівами</p>
+          <p class="text-xs text-gray-400 mt-0.5">Помісячне збереження траєкторій цілей, оптимізація під SD-карту та хмарне сховище Google Drive</p>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-3">
+          <!-- Перемикач Увімкнення / Вимкнення запису історії -->
+          <label class="flex items-center gap-2 cursor-pointer bg-gray-950 border border-gray-800 px-3 py-1.5 rounded text-xs font-semibold select-none hover:border-gray-700 transition">
+            <input type="checkbox" id="histEnabledToggle" onchange="toggleHistoryRecording(this.checked)" class="accent-emerald-500 w-4 h-4 cursor-pointer">
+            <span id="histEnabledLabel" class="text-emerald-400">🟢 Запис історії активний</span>
+          </label>
           <button onclick="document.getElementById('histAdminFileInput').click()" class="bg-sky-600 hover:bg-sky-700 text-white px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Завантажити JSON історії (наприклад, файл від друга)">📤 Додати JSON файл</button>
           <input type="file" id="histAdminFileInput" accept=".json" class="hidden" onchange="uploadAdminHistory(event)">
           <button onclick="loadAdminHistory()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold transition" title="Оновити список">🔄 Оновити</button>
+        </div>
+      </div>
+
+      <!-- Інтеграція Google Drive -->
+      <div class="p-4 bg-gray-950/70 border-b border-gray-800 grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">🔗 Папка на Google Диску:</label>
+          <div class="flex gap-2">
+            <input type="text" id="histGdriveUrl" placeholder="https://drive.google.com/drive/folders/..." class="flex-1 bg-gray-900 border border-gray-700 px-3 py-1.5 rounded text-xs text-white focus:border-sky-500 font-mono">
+            <button onclick="saveHistoryGdriveUrl()" class="bg-sky-700 hover:bg-sky-600 text-white px-3 py-1.5 rounded text-xs font-semibold transition">Зберегти</button>
+            <button onclick="openGoogleDriveFolder()" class="bg-gray-800 hover:bg-gray-700 text-sky-400 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Відкрити папку Google Drive">📂 Відкрити</button>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">☁️ Webhook (Apps Script URL):</label>
+          <div class="flex gap-2">
+            <input type="text" id="histGdriveWebhook" placeholder="https://script.google.com/macros/s/.../exec" class="flex-1 bg-gray-900 border border-gray-700 px-3 py-1.5 rounded text-xs text-white focus:border-sky-500 font-mono">
+            <button onclick="saveHistoryWebhook()" class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded text-xs font-semibold transition">Зберегти</button>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">⏱️ Автовивантаження (період у годинах):</label>
+          <div class="flex items-center gap-2">
+            <input type="number" id="histSyncHours" min="0" max="720" step="1" placeholder="0" class="w-20 bg-gray-900 border border-gray-700 px-3 py-1.5 rounded text-xs text-white focus:border-amber-500 font-mono text-center">
+            <span class="text-xs text-gray-400">год. (0 = тільки по кнопці)</span>
+            <button onclick="saveHistorySyncHours()" class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded text-xs font-semibold transition">Зберегти</button>
+          </div>
+          <div id="histLastSyncInfo" class="text-[11px] text-gray-400 mt-1">Остання синхронізація: ніколи</div>
         </div>
       </div>
 
@@ -3176,6 +3429,134 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
 
 
+    async function loadHistoryConfig() {
+      try {
+        const res = await fetch("/api/v1/admin/history/config?admin_key=" + encodeURIComponent(currentAdminKey));
+        if (!res.ok) return;
+        const data = await res.json();
+        const cfg = data.config || {};
+        
+        const toggle = document.getElementById("histEnabledToggle");
+        const lbl = document.getElementById("histEnabledLabel");
+        if (toggle && lbl) {
+          toggle.checked = cfg.enabled !== false;
+          lbl.innerText = toggle.checked ? "🟢 Запис історії активний" : "⚪ Запис історії вимкнено";
+          lbl.className = toggle.checked ? "text-emerald-400" : "text-gray-500";
+        }
+        
+        const gUrl = document.getElementById("histGdriveUrl");
+        if (gUrl) gUrl.value = cfg.gdrive_url || "";
+        
+        const gWb = document.getElementById("histGdriveWebhook");
+        if (gWb) gWb.value = cfg.gdrive_webhook || "";
+        
+        const hHours = document.getElementById("histSyncHours");
+        if (hHours) hHours.value = cfg.gdrive_sync_hours !== undefined ? cfg.gdrive_sync_hours : 0;
+        
+        const lastSyncEl = document.getElementById("histLastSyncInfo");
+        if (lastSyncEl) {
+          lastSyncEl.innerText = cfg.last_gdrive_sync_ts ? `Остання автосинхронізація: ${new Date(cfg.last_gdrive_sync_ts * 1000).toLocaleString()}` : "Остання автосинхронізація: ще не виконувалась";
+        }
+      } catch (e) {
+        console.error("Error loading history config:", e);
+      }
+    }
+
+    async function toggleHistoryRecording(enabled) {
+      const lbl = document.getElementById("histEnabledLabel");
+      if (lbl) {
+        lbl.innerText = enabled ? "🟢 Запис історії активний" : "⚪ Запис історії вимкнено";
+        lbl.className = enabled ? "text-emerald-400" : "text-gray-500";
+      }
+      try {
+        await fetch("/api/v1/admin/history/config?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled })
+        });
+      } catch (e) {
+        alert("Помилка збереження налаштування: " + e);
+      }
+    }
+
+    async function saveHistoryGdriveUrl() {
+      const url = document.getElementById("histGdriveUrl").value.trim();
+      try {
+        await fetch("/api/v1/admin/history/config?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gdrive_url: url })
+        });
+        alert("Посилання на Google Диск збережено!");
+      } catch (e) {
+        alert("Помилка збереження: " + e);
+      }
+    }
+
+    async function saveHistoryWebhook() {
+      const webhook = document.getElementById("histGdriveWebhook").value.trim();
+      try {
+        await fetch("/api/v1/admin/history/config?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gdrive_webhook: webhook })
+        });
+        alert("Webhook Google Apps Script збережено!");
+      } catch (e) {
+        alert("Помилка збереження: " + e);
+      }
+    }
+
+    async function saveHistorySyncHours() {
+      const hours = parseInt(document.getElementById("histSyncHours").value, 10) || 0;
+      try {
+        await fetch("/api/v1/admin/history/config?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gdrive_sync_hours: hours })
+        });
+        alert(`Період автовивантаження (${hours} год.) збережено!${hours > 0 ? " Бекенд автоматично оновлюватиме файл на Google Диску." : " Автовивантаження вимкнено (тільки по кнопці)."}`);
+      } catch (e) {
+        alert("Помилка збереження: " + e);
+      }
+    }
+
+    function openGoogleDriveFolder() {
+      const url = document.getElementById("histGdriveUrl").value.trim();
+      if (!url) {
+        alert("Будь ласка, введіть та збережіть посилання на папку Google Диску!");
+        return;
+      }
+      window.open(url, "_blank");
+    }
+
+    async function restoreHistoryFromGDrive(month) {
+      if (!confirm(`Підтягнути файл історії за ${month} з Google Диску назад у локальну пам\'ять хаба?`)) return;
+      try {
+        const res = await fetch("/api/v1/admin/history/restore_gdrive/" + encodeURIComponent(month) + "?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST"
+        });
+        const resp = await res.json();
+        alert(resp.message || (resp.status === "ok" ? "Успішно відновлено!" : "Помилка"));
+        loadAdminHistory();
+      } catch (e) {
+        alert("Помилка запиту: " + e);
+      }
+    }
+
+    async function syncHistoryToGDrive(month) {
+      if (!confirm(`Відправити файл історії за ${month} на Google Диск через Webhook?`)) return;
+      try {
+        const res = await fetch("/api/v1/admin/history/sync_gdrive/" + encodeURIComponent(month) + "?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST"
+        });
+        const resp = await res.json();
+        alert(resp.message || (resp.status === "ok" ? "Успішно відправлено!" : "Помилка передачі"));
+      } catch (e) {
+        alert("Помилка запиту: " + e);
+      }
+    }
+
     async function loadAdminHistory() {
       const tbody = document.getElementById("histTableBody");
       const badge = document.getElementById("histTotalBadge");
@@ -3199,20 +3580,46 @@ ADMIN_HTML = """<!DOCTYPE html>
           const datesStr = f.dates && f.dates.length > 0 ? f.dates.join(", ") : "Немає";
           const updatedStr = f.updated_at ? new Date(f.updated_at * 1000).toLocaleString() : "--";
           
+          let storageBadge = "";
+          let actionButtons = "";
+
+          if (f.is_local && f.on_gdrive) {
+            storageBadge = '<span class="text-[10px] bg-emerald-950/70 border border-emerald-700 text-emerald-300 px-1.5 py-0.5 rounded font-semibold">💾 Локально + ☁️ Хмара</span>';
+            actionButtons = `
+              <button onclick="syncHistoryToGDrive('${f.month}')" class="text-xs bg-sky-950/60 hover:bg-sky-900 text-sky-300 border border-sky-700/60 px-2.5 py-1 rounded transition" title="Оновити файл у Google Диску">☁️ Оновити в хмарі</button>
+              <button onclick="downloadHistoryFile('${f.month}')" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-2.5 py-1 rounded transition" title="Завантажити JSON на ПК">📥 Завантажити</button>
+              <button onclick="deleteHistoryFile('${f.month}')" class="text-xs bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-800/50 px-2.5 py-1 rounded transition" title="Видалити локальний файл для економії пам\'яті (файл залишиться в Google Диску!)">🗑️ Очистити з SD</button>
+            `;
+          } else if (f.is_local) {
+            storageBadge = '<span class="text-[10px] bg-gray-800 border border-gray-600 text-gray-300 px-1.5 py-0.5 rounded font-semibold">💾 Тільки локально</span>';
+            actionButtons = `
+              <button onclick="syncHistoryToGDrive('${f.month}')" class="text-xs bg-sky-950/60 hover:bg-sky-900 text-sky-300 border border-sky-700/60 px-2.5 py-1 rounded transition" title="Надіслати цей місяць на Google Диск">☁️ На Google Диск</button>
+              <button onclick="downloadHistoryFile('${f.month}')" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-2.5 py-1 rounded transition" title="Завантажити JSON на ПК">📥 Завантажити</button>
+              <button onclick="deleteHistoryFile('${f.month}')" class="text-xs bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-800/50 px-2.5 py-1 rounded transition" title="Видалити цей місяць">🗑️ Видалити</button>
+            `;
+          } else {
+            storageBadge = '<span class="text-[10px] bg-sky-950/70 border border-sky-600 text-sky-300 px-1.5 py-0.5 rounded font-semibold">☁️ В Google Диску (SD вільна)</span>';
+            actionButtons = `
+              <button onclick="restoreHistoryFromGDrive('${f.month}')" class="text-xs bg-emerald-950/70 hover:bg-emerald-900 text-emerald-300 border border-emerald-700 px-2.5 py-1 rounded transition font-semibold" title="Підтягнути файл з Google Диску назад на локальну пам\'ять">📥 Завантажити в хаб</button>
+            `;
+          }
+
           html += `
             <tr class="hover:bg-gray-800/50 transition">
-              <td class="p-3 font-semibold text-white flex items-center gap-2">
-                <span class="text-sky-400">📅</span>
-                <span>${f.month}</span>
-                <span class="text-xs text-gray-500 font-mono">(${f.filename})</span>
+              <td class="p-3 font-semibold text-white">
+                <div class="flex items-center gap-2">
+                  <span class="text-sky-400">📅</span>
+                  <span>${f.month}</span>
+                  ${storageBadge}
+                </div>
+                <div class="text-[11px] text-gray-500 font-mono mt-0.5">${f.filename}</div>
               </td>
               <td class="p-3 text-xs text-gray-300 font-mono">${datesStr}</td>
               <td class="p-3"><span class="bg-gray-800 text-amber-400 text-xs px-2 py-0.5 rounded font-mono font-bold">${f.total_targets}</span></td>
-              <td class="p-3 font-mono text-emerald-400 text-xs font-bold">${f.size_kb} КБ</td>
+              <td class="p-3 font-mono text-emerald-400 text-xs font-bold">${f.size_kb !== "--" ? f.size_kb + " КБ" : "--"}</td>
               <td class="p-3 text-xs text-gray-400">${updatedStr}</td>
               <td class="p-3 text-right space-x-2">
-                <button onclick="downloadHistoryFile('${f.month}')" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-2.5 py-1 rounded transition" title="Завантажити JSON на ПК">📥 Завантажити</button>
-                <button onclick="deleteHistoryFile('${f.month}')" class="text-xs bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-800/50 px-2.5 py-1 rounded transition" title="Видалити цей місяць">🗑️ Видалити</button>
+                ${actionButtons}
               </td>
             </tr>
           `;
@@ -3235,6 +3642,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         });
         if (res.ok) {
           loadAdminHistory();
+      loadHistoryConfig();
         } else {
           alert("Помилка при видаленні файлу!");
         }
@@ -3628,6 +4036,36 @@ async def handle_root(request: web.Request):
         return web.Response(text="404: Not Found", status=404)
     raise web.HTTPFound("/admin")
 
+async def run_history_auto_sync():
+    """Фонова задача автовивантаження історії на Google Drive кожні N годин."""
+    while True:
+        try:
+            await asyncio.sleep(60) # Перевірка щохвилини
+            if not history_manager.is_enabled():
+                continue
+            hours = int(history_manager.config.get("gdrive_sync_hours", 0) or 0)
+            webhook_url = history_manager.config.get("gdrive_webhook", "").strip()
+            if hours <= 0 or not webhook_url:
+                continue
+
+            now = time.time()
+            last_sync = history_manager.config.get("last_gdrive_sync_ts", 0)
+            interval_sec = hours * 3600
+            if (now - last_sync) >= interval_sec:
+                current_month = time.strftime("%Y-%m", time.gmtime(now))
+                history_manager.flush_to_disk(force=True)
+                logger.info(f"☁️ [AutoSync] Автоматичне вивантаження історії за {current_month} на Google Drive (період: {hours} год.)...")
+                ok, msg = await history_manager.sync_to_gdrive(current_month)
+                if ok:
+                    logger.info(f"☁️ [AutoSync] Успішно оновлено {current_month} на Google Диску.")
+                else:
+                    logger.warning(f"☁️ [AutoSync] Помилка автовивантаження: {msg}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in history auto-sync loop: {e}")
+            await asyncio.sleep(30)
+
 # =====================================================================
 # ИНИЦИАЛИЗАЦИЯ И СТАРТ ПРИЛОЖЕНИЯ
 # =====================================================================
@@ -3636,11 +4074,14 @@ async def on_startup(app):
     app["task_ua"] = asyncio.create_task(run_ukrainealarm_collector())
     app["task_alerts"] = asyncio.create_task(run_official_alerts_collector())
     app["task_failover"] = asyncio.create_task(run_failover_neptun_collector())
+    app["task_history_sync"] = asyncio.create_task(run_history_auto_sync())
 
 async def on_cleanup(app):
     app["task_ua"].cancel()
     app["task_alerts"].cancel()
     app["task_failover"].cancel()
+    if "task_history_sync" in app:
+        app["task_history_sync"].cancel()
 
 def create_app() -> web.Application:
     app = web.Application()
@@ -3690,14 +4131,14 @@ async def handle_get_regions_geojson(request: web.Request):
     return web.json_response({"error": "GeoJSON not found"}, status=404)
 
 async def handle_get_history_months(request: web.Request):
-    """Повертає список доступних місяців та дат в архіві історії."""
+    """Повертає список доступних місяців та дат в архіві історії (локальні + Google Диск)."""
     user = get_authenticated_user(request)
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
-    months = history_manager.get_available_months()
-    return web.json_response({"status": "ok", "months": months})
+    months, sources = await history_manager.get_available_months_combined()
+    return web.json_response({"status": "ok", "months": months, "sources": sources})
 
 async def handle_get_history(request: web.Request):
-    """Повертає історію польотів за місяць або конкретну дату."""
+    """Повертає історію польотів за місяць або конкретну дату (з автопідтягуванням з Google Диску)."""
     user = get_authenticated_user(request)
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
     month = request.query.get("month")
@@ -3707,7 +4148,7 @@ async def handle_get_history(request: web.Request):
         month = time.strftime("%Y-%m", now_dt)
     elif not month and date:
         month = date[:7]
-    data = history_manager.get_history(month, date_str=date)
+    data = await history_manager.get_history_async(month, date_str=date)
     return web.json_response(data)
 
 async def handle_upload_history(request: web.Request):
@@ -3738,6 +4179,10 @@ async def handle_upload_history(request: web.Request):
     app.router.add_put("/api/v1/admin/keys/{key}", handle_admin_update_key)
     app.router.add_put("/api/v1/admin/keys/{key}/settings", handle_admin_update_user_settings)
     app.router.add_delete("/api/v1/admin/keys/{key}", handle_admin_delete_key)
+    app.router.add_get("/api/v1/admin/history/config", handle_admin_get_history_config)
+    app.router.add_post("/api/v1/admin/history/config", handle_admin_set_history_config)
+    app.router.add_post("/api/v1/admin/history/sync_gdrive/{month}", handle_admin_sync_gdrive)
+    app.router.add_post("/api/v1/admin/history/restore_gdrive/{month}", handle_admin_restore_gdrive)
     app.router.add_get("/api/v1/admin/history", handle_admin_get_history)
     app.router.add_delete("/api/v1/admin/history/{month}", handle_admin_delete_history)
     app.router.add_get("/api/v1/admin/history/download/{month}", handle_admin_download_history)
