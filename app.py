@@ -47,6 +47,26 @@ if not ADMIN_SECRET_KEY:
     ADMIN_SECRET_KEY = "admin_super_secret_master_key_123"
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 CONFIG_FILE = os.path.join(DATA_DIR, "hub_config.json")
+
+# Автоматична ініціалізація початкових файлів (GeoJSON, конфігурація історії) у DATA_DIR
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    defaults_dir = os.environ.get("DATA_DEFAULTS_DIR", "/app/data_defaults")
+    if os.path.exists(defaults_dir):
+        import shutil
+        for item in os.listdir(defaults_dir):
+            s_item = os.path.join(defaults_dir, item)
+            d_item = os.path.join(DATA_DIR, item)
+            if not os.path.exists(d_item):
+                try:
+                    if os.path.isdir(s_item):
+                        shutil.copytree(s_item, d_item)
+                    else:
+                        shutil.copy2(s_item, d_item)
+                except Exception as e:
+                    pass
+except Exception:
+    pass
 DANGER_RADIUS_KM = float(os.environ.get("DANGER_RADIUS_KM", 35.0))
 UPSTREAM_PROXY = os.environ.get("UPSTREAM_PROXY", "").strip()
 oblast_detector = OblastDetector()
@@ -872,6 +892,7 @@ class HistoryManager:
                 return res["months"]
         except Exception as e:
             logger.debug(f"Could not fetch months list from Google Drive: {e}")
+            self._gdrive_months_cache = {"ts": now, "months": []}
         return getattr(self, "_gdrive_months_cache", {}).get("months", [])
 
     async def get_available_months_combined(self):
@@ -1167,8 +1188,10 @@ class ThreatState:
 
         # 2. Анализ летящих целей в небе (Centrifugo / TargetTracker)
         for trk in self.tracker.tracks.values():
-            ob_info = oblast_detector.find_oblast_info(trk.lat, trk.lon)
-            ob_id = str(ob_info.get("id", "0"))
+            ob_id = str(getattr(trk, "oblast_id", "0") or "0")
+            if ob_id == "0":
+                ob_info = oblast_detector.find_oblast_info(trk.lat, trk.lon)
+                ob_id = str(ob_info.get("id", "0"))
             if ob_id in ob_status:
                 ob = ob_status[ob_id]
                 ob["targets_count"] += 1
@@ -1402,9 +1425,12 @@ class ThreatState:
             # Индивидуальный радиус опасности для этого расположения
             s_danger_km = float(s_data.get("danger_radius_km", u_settings.get("danger_radius_km", DANGER_RADIUS_KM)))
 
-            s_info = oblast_detector.find_oblast_info(s_lat, s_lon)
-            s_oblast = s_info["name"]
-            s_rid = s_info["id"]
+            if "cached_oblast" not in s_data or "cached_oblast_id" not in s_data:
+                s_info = oblast_detector.find_oblast_info(s_lat, s_lon)
+                s_data["cached_oblast"] = s_info["name"]
+                s_data["cached_oblast_id"] = s_info["id"]
+            s_oblast = s_data["cached_oblast"]
+            s_rid = s_data["cached_oblast_id"]
 
             threats_in_s_oblast = sum(1 for trk in active_tracks if trk.oblast == s_oblast)
 
@@ -4083,51 +4109,29 @@ async def on_cleanup(app):
     if "task_history_sync" in app:
         app["task_history_sync"].cancel()
 
-def create_app() -> web.Application:
-    app = web.Application()
-
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/api/v1/health", lambda r: web.json_response({
-        "status": "ok",
-        "service": "Air Alert Hub",
-        "active_threats_count": len(state.tracker.tracks),
-        "official_sirens_count": len(state.official_alerts),
-        "mig31k_active": state.mig_active,
-        "upstream_provider": state.upstream_provider,
-        "upstream_name": "Основной (WebSocket map.ukrainealarm.com)" if state.upstream_provider == "ukrainealarm" else ("Резервный (REST neptun.in.ua)" if state.upstream_provider == "neptun_failover" else "Ожидание подключения"),
-        "unknown_target_types_count": len(UNKNOWN_TARGET_TYPES_CATALOG),
-        "unknown_target_types": list(UNKNOWN_TARGET_TYPES_CATALOG.values()),
-        "proxy_enabled": bool(UPSTREAM_PROXY),
-        "proxy_info": mask_proxy(UPSTREAM_PROXY)
-    }))
-    app.router.add_get("/api/v1/unknown_types", lambda r: web.json_response({
-        "status": "ok",
-        "count": len(UNKNOWN_TARGET_TYPES_CATALOG),
-        "catalog": list(UNKNOWN_TARGET_TYPES_CATALOG.values())
-    }))
-    app.router.add_get("/api/v1/slots", handle_get_slots)
-    app.router.add_post("/api/v1/slots", handle_create_slot)
-    app.router.add_put("/api/v1/slots/{slot_id}", handle_update_slot)
-    app.router.add_delete("/api/v1/slots/{slot_id}", handle_delete_slot)
-    app.router.add_post("/api/v1/locations/dynamic", handle_update_dynamic)
-    app.router.add_get("/api/v1/settings", handle_get_settings)
-    app.router.add_put("/api/v1/settings", handle_update_settings)
-    app.router.add_post("/api/v1/settings", handle_update_settings)
-    app.router.add_get("/api/v1/threats", handle_get_threats)
-    app.router.add_get("/api/v1/radar", handle_get_radar)
-    
 # =====================================================================
 # API ЕНДПОІНТИ ДЛЯ GEOJSON РЕГІОНІВ ТА ІСТОРІЇ ПОЛЬОТІВ
 # =====================================================================
 
 async def handle_get_regions_geojson(request: web.Request):
     """Повертає оптимізований GeoJSON 26 областей України для карти."""
-    for fn in ["ukraine_oblasts_compact.geojson", "ukraine_oblasts.geojson"]:
-        geojson_path = os.path.join(DATA_DIR, fn)
-        if os.path.exists(geojson_path):
-            with open(geojson_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return web.json_response(data, headers={"Cache-Control": "public, max-age=86400"})
+    search_dirs = [
+        DATA_DIR,
+        "/app/data_defaults",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+        os.path.dirname(os.path.abspath(__file__)),
+        "/app"
+    ]
+    for d in search_dirs:
+        for fn in ["ukraine_oblasts_compact.geojson", "ukraine_oblasts.geojson", "regions.geojson"]:
+            geojson_path = os.path.join(d, fn)
+            if os.path.exists(geojson_path):
+                try:
+                    with open(geojson_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return web.json_response(data, headers={"Cache-Control": "public, max-age=86400"})
+                except Exception as e:
+                    logger.error(f"Error reading GeoJSON {geojson_path}: {e}")
     return web.json_response({"error": "GeoJSON not found"}, status=404)
 
 async def handle_get_history_months(request: web.Request):
@@ -4162,6 +4166,38 @@ async def handle_upload_history(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=400)
 
+def create_app() -> web.Application:
+    app = web.Application()
+
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/api/v1/health", lambda r: web.json_response({
+        "status": "ok",
+        "service": "Air Alert Hub",
+        "active_threats_count": len(state.tracker.tracks),
+        "official_sirens_count": len(state.official_alerts),
+        "mig31k_active": state.mig_active,
+        "upstream_provider": state.upstream_provider,
+        "upstream_name": "Основной (WebSocket map.ukrainealarm.com)" if state.upstream_provider == "ukrainealarm" else ("Резервный (REST neptun.in.ua)" if state.upstream_provider == "neptun_failover" else "Ожидание подключения"),
+        "unknown_target_types_count": len(UNKNOWN_TARGET_TYPES_CATALOG),
+        "unknown_target_types": list(UNKNOWN_TARGET_TYPES_CATALOG.values()),
+        "proxy_enabled": bool(UPSTREAM_PROXY),
+        "proxy_info": mask_proxy(UPSTREAM_PROXY)
+    }))
+    app.router.add_get("/api/v1/unknown_types", lambda r: web.json_response({
+        "status": "ok",
+        "count": len(UNKNOWN_TARGET_TYPES_CATALOG),
+        "catalog": list(UNKNOWN_TARGET_TYPES_CATALOG.values())
+    }))
+    app.router.add_get("/api/v1/slots", handle_get_slots)
+    app.router.add_post("/api/v1/slots", handle_create_slot)
+    app.router.add_put("/api/v1/slots/{slot_id}", handle_update_slot)
+    app.router.add_delete("/api/v1/slots/{slot_id}", handle_delete_slot)
+    app.router.add_post("/api/v1/locations/dynamic", handle_update_dynamic)
+    app.router.add_get("/api/v1/settings", handle_get_settings)
+    app.router.add_put("/api/v1/settings", handle_update_settings)
+    app.router.add_post("/api/v1/settings", handle_update_settings)
+    app.router.add_get("/api/v1/threats", handle_get_threats)
+    app.router.add_get("/api/v1/radar", handle_get_radar)
     app.router.add_get("/api/v1/map", handle_get_map)
     app.router.add_get("/api/v1/regions/geojson", handle_get_regions_geojson)
     app.router.add_get("/api/v1/history/months", handle_get_history_months)
