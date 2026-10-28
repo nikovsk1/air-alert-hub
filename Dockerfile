@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir aiohttp websockets
 COPY app.py /app/app.py
 COPY oblast_detector.py /app/oblast_detector.py
 COPY regions.geojson /app/regions.geojson
+COPY data/ /app/data_defaults/
 
 EXPOSE 8088
 
