@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "gdrive_url": "",
+  "gdrive_webhook": "",
+  "gdrive_sync_hours": 0,
+  "last_gdrive_sync_ts": 0
+}
