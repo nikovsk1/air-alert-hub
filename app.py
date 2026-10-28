@@ -564,7 +564,11 @@ class TargetTrack:
 
         self.lat = lat
         self.lon = lon
-        self.heading = heading
+        # Вычисляем точный динамический курс по фактическому перемещению (0..360° без грубого 90° округления)
+        if dist_from_last > 0.2:
+            self.heading = round(calculate_bearing(last_pt["lat"], last_pt["lon"], lat, lon), 1)
+        elif heading is not None and heading > 0:
+            self.heading = round(float(heading), 1)
         if speed_kmh and speed_kmh > 0:
             self.speed_kmh = speed_kmh
         self.oblast = oblast
@@ -589,6 +593,261 @@ class TargetTrack:
                 "lon": round(math.degrees(lambda2), 5)
             })
         return corridor
+
+
+# =====================================================================
+# МЕНЕДЖЕР ІСТОРІЇ ПОЛЬОТІВ (ПОМІСЯЧНІ АРХІВИ, ЗАХИСТ SD-КАРТКИ ВІД ЗНОСУ)
+# =====================================================================
+
+class HistoryManager:
+    """Збереження та надання історії польотів за місяцями та днями."""
+    def __init__(self, data_dir: str):
+        self.history_dir = os.path.join(data_dir, "history")
+        os.makedirs(self.history_dir, exist_ok=True)
+        self.active_tracks = {} # tid -> entry
+        self.dirty_months = set()
+        self.last_flush_ts = time.time()
+        self.flush_interval = 300.0 # 5 хвилин між скиданнями на диск для збереження ресурсу SD-карти
+        self._cache = {} # month_str -> full dict
+
+    def update_point(self, trk):
+        now = time.time()
+        tid = trk.id
+        dt_str = time.strftime("%Y-%m-%d", time.gmtime(trk.first_seen))
+        month_str = dt_str[:7]
+
+        if tid not in self.active_tracks:
+            self.active_tracks[tid] = {
+                "id": tid,
+                "cat": trk.category,
+                "name_ua": trk.type,
+                "raw_type": getattr(trk, "raw_type", ""),
+                "status": "active",
+                "date": dt_str,
+                "start_time": int(trk.first_seen),
+                "end_time": int(now),
+                "path": []
+            }
+
+        entry = self.active_tracks[tid]
+        entry["end_time"] = int(now)
+
+        lat = round(trk.lat, 4)
+        lon = round(trk.lon, 4)
+        heading = round(trk.heading, 1)
+        speed = round(trk.speed_kmh, 1)
+
+        # Тонке стиснення: не дублювати нерухомі або занадто часті точки
+        if entry["path"]:
+            last = entry["path"][-1]
+            if abs(lat - last[1]) < 0.0002 and abs(lon - last[2]) < 0.0002 and (now - last[0]) < 5.0:
+                return
+
+        entry["path"].append([int(now), lat, lon, heading, speed])
+        self.dirty_months.add(month_str)
+
+    def finish_track(self, trk, status="lost"):
+        tid = trk.id
+        now = time.time()
+        if tid in self.active_tracks:
+            entry = self.active_tracks[tid]
+            entry["status"] = status
+            entry["end_time"] = int(now)
+            month_str = entry["date"][:7]
+            self._commit_to_month(entry, month_str)
+            del self.active_tracks[tid]
+            self.dirty_months.add(month_str)
+
+    def _commit_to_month(self, entry, month_str):
+        m_data = self._load_month_data(month_str)
+        m_data["targets"][entry["id"]] = entry
+        if entry["date"] not in m_data["dates"]:
+            m_data["dates"].append(entry["date"])
+            m_data["dates"].sort()
+        m_data["total_targets"] = len(m_data["targets"])
+        m_data["updated_at"] = int(time.time())
+
+    def _load_month_data(self, month_str):
+        if month_str in self._cache:
+            return self._cache[month_str]
+        filepath = os.path.join(self.history_dir, f"flight_history_{month_str}.json")
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    self._cache[month_str] = d
+                    return d
+            except Exception as e:
+                logger.error(f"Error reading history file {filepath}: {e}")
+        new_d = {
+            "month": month_str,
+            "dates": [],
+            "total_targets": 0,
+            "updated_at": int(time.time()),
+            "targets": {}
+        }
+        self._cache[month_str] = new_d
+        return new_d
+
+    def flush_to_disk(self, force=False):
+        now = time.time()
+        if not force and (now - self.last_flush_ts) < self.flush_interval:
+            return
+        if not self.dirty_months:
+            return
+
+        for m in list(self.dirty_months):
+            if m in self._cache:
+                d = self._cache[m]
+                for entry in self.active_tracks.values():
+                    if entry["date"].startswith(m):
+                        d["targets"][entry["id"]] = entry
+                        if entry["date"] not in d["dates"]:
+                            d["dates"].append(entry["date"])
+                            d["dates"].sort()
+                d["total_targets"] = len(d["targets"])
+                d["updated_at"] = int(now)
+
+                filepath = os.path.join(self.history_dir, f"flight_history_{m}.json")
+                tmp_path = filepath + ".tmp"
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(d, f, ensure_ascii=False, separators=(',', ':'))
+                    os.replace(tmp_path, filepath)
+                    logger.info(f"💾 [HistoryManager] Збережено історію за {m}: {d['total_targets']} цілей.")
+                except Exception as e:
+                    logger.error(f"Error saving history {filepath}: {e}")
+
+        self.dirty_months.clear()
+        self.last_flush_ts = now
+
+    def get_available_months(self):
+        months_dict = {}
+        if os.path.exists(self.history_dir):
+            for fn in os.listdir(self.history_dir):
+                if fn.startswith("flight_history_") and fn.endswith(".json"):
+                    m_str = fn.replace("flight_history_", "").replace(".json", "")
+                    d = self._load_month_data(m_str)
+                    months_dict[m_str] = d.get("dates", [])
+        return months_dict
+
+    def get_history(self, month_str, date_str=None):
+        d = self._load_month_data(month_str)
+        if not date_str:
+            return d
+        filtered = {
+            tid: t for tid, t in d.get("targets", {}).items()
+            if t.get("date") == date_str
+        }
+        return {
+            "month": month_str,
+            "date": date_str,
+            "total_targets": len(filtered),
+            "targets": filtered
+        }
+
+    def import_external_history(self, raw_data: dict) -> int:
+        items = raw_data.values() if isinstance(raw_data, dict) else raw_data
+        count = 0
+        for item in items:
+            tid = item.get("display_id") or item.get("id")
+            if not tid: continue
+            raw_t = item.get("type", "")
+            raw_c = item.get("raw_type_code", 0)
+            cat, meta = classify_target(raw_t, raw_c)
+            s_time = item.get("start_time", 0)
+            e_time = item.get("end_time", s_time)
+            dt_str = time.strftime("%Y-%m-%d", time.gmtime(s_time))
+            m_str = dt_str[:7]
+
+            raw_path = item.get("path", [])
+            c_path = []
+            for p in raw_path:
+                if isinstance(p, list) and len(p) >= 3:
+                    c_path.append(p)
+                elif isinstance(p, dict):
+                    c_path.append([
+                        p.get("time", 0),
+                        round(float(p.get("lat", 0)), 4),
+                        round(float(p.get("lon", 0)), 4),
+                        round(float(p.get("heading", 0)), 1),
+                        round(float(p.get("speed", 185.0)), 1)
+                    ])
+
+            entry = {
+                "id": tid,
+                "cat": cat,
+                "name_ua": meta["name_ua"],
+                "raw_type": raw_t,
+                "status": item.get("status", "lost"),
+                "date": dt_str,
+                "start_time": s_time,
+                "end_time": e_time,
+                "path": c_path
+            }
+            self._commit_to_month(entry, m_str)
+            self.dirty_months.add(m_str)
+            count += 1
+
+        self.flush_to_disk(force=True)
+        return count
+
+    def get_admin_summary(self):
+        files_list = []
+        total_sz = 0
+        total_targets = 0
+        if os.path.exists(self.history_dir):
+            for fn in sorted(os.listdir(self.history_dir), reverse=True):
+                if fn.startswith("flight_history_") and fn.endswith(".json"):
+                    m_str = fn.replace("flight_history_", "").replace(".json", "")
+                    fp = os.path.join(self.history_dir, fn)
+                    sz = os.path.getsize(fp)
+                    total_sz += sz
+                    d = self._load_month_data(m_str)
+                    t_count = d.get("total_targets", len(d.get("targets", {})))
+                    total_targets += t_count
+                    files_list.append({
+                        "filename": fn,
+                        "month": m_str,
+                        "size_bytes": sz,
+                        "size_kb": round(sz / 1024, 1),
+                        "total_targets": t_count,
+                        "dates": d.get("dates", []),
+                        "updated_at": d.get("updated_at", int(os.path.getmtime(fp)))
+                    })
+        return {
+            "total_size_bytes": total_sz,
+            "total_size_mb": f"{total_sz / (1024 * 1024):.2f} MB",
+            "total_files": len(files_list),
+            "total_targets": total_targets,
+            "files": files_list
+        }
+
+    def delete_month(self, month_str):
+        fn = f"flight_history_{month_str}.json"
+        fp = os.path.join(self.history_dir, fn)
+        tmp = fp + ".tmp"
+        deleted = False
+        if os.path.exists(fp):
+            try:
+                os.remove(fp)
+                deleted = True
+            except Exception as e:
+                logger.error(f"Error removing {fp}: {e}")
+        if os.path.exists(tmp):
+            try: os.remove(tmp)
+            except Exception: pass
+        if month_str in self._cache:
+            del self._cache[month_str]
+        self.dirty_months.discard(month_str)
+        return deleted
+
+    def get_month_filepath(self, month_str):
+        fn = f"flight_history_{month_str}.json"
+        fp = os.path.join(self.history_dir, fn)
+        return fp if os.path.exists(fp) else None
+
+history_manager = HistoryManager(DATA_DIR)
 
 class TargetTracker:
     """Менеджер всех сопровождаемых целей."""
@@ -637,7 +896,14 @@ class TargetTracker:
         # Очистка исчезнувших целей (если не появлялись в потоке более 25 секунд)
         expired = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 25.0]
         for tid in expired:
+            trk = self.tracks[tid]
+            history_manager.finish_track(trk, status="lost")
             del self.tracks[tid]
+
+        # Запись текущих точек активных целей в кольцевой буфер истории
+        for trk in self.tracks.values():
+            history_manager.update_point(trk)
+        history_manager.flush_to_disk()
 
         return list(self.tracks.values())
 
@@ -937,6 +1203,7 @@ class ThreatState:
                 "bearing_deg": round(bearing, 1),
                 "bearing_sector": bearing_to_compass(bearing),
                 "heading": heading,
+                "heading_deg": heading,
                 "speed_kmh": speed,
                 "approach_status": approach_status,
                 "approach_desc": approach_desc,
@@ -1033,6 +1300,7 @@ class ThreatState:
             "owner": user["owner"],
             "upstream_provider": self.upstream_provider,
             "active_threats_total": len(active_tracks),
+            "total_threats_in_country": len(active_tracks),
             "general_alerts": {
                 "mig31k_active": self.mig_active,
                 "total_official_sirens": len(self.official_alerts),
@@ -1324,6 +1592,7 @@ def extract_targets(decoded_data):
                     "oblast": ob_info["name"],
                     "oblast_id": ob_info["id"],
                     "heading": heading,
+                "heading_deg": heading,
                     "speed_kmh": speed
                 })
         except Exception: continue
@@ -1478,6 +1747,7 @@ async def run_failover_neptun_collector():
                             "oblast": ob_info["name"],
                             "oblast_id": ob_info["id"],
                             "heading": heading,
+                "heading_deg": heading,
                             "speed_kmh": meta["default_speed"]
                         })
                     await state.update_threats(normalized, provider="neptun_failover")
@@ -1721,7 +1991,7 @@ async def handle_get_threats(request: web.Request):
     user = get_authenticated_user(request)
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
 
-    slot_id = request.query.get("slot", "1")
+    slot_id = request.query.get("slot_id") or request.query.get("slot", "1")
     radius = float(request.query.get("radius", 0)) or None
     custom_lat = float(request.query["lat"]) if "lat" in request.query else None
     custom_lon = float(request.query["lon"]) if "lon" in request.query else None
@@ -1746,7 +2016,7 @@ async def handle_get_radar(request: web.Request):
     user = get_authenticated_user(request)
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
 
-    slot_id = request.query.get("slot", "1")
+    slot_id = request.query.get("slot_id") or request.query.get("slot", "1")
     radius = float(request.query.get("radius", 100.0))
     custom_lat = float(request.query["lat"]) if "lat" in request.query else None
     custom_lon = float(request.query["lon"]) if "lon" in request.query else None
@@ -1784,7 +2054,7 @@ async def handle_websocket_stream(request: web.Request):
     sub_tuple = (ws, user)
     state.ws_subscribers.add(sub_tuple)
 
-    slot_id = request.query.get("slot", "1")
+    slot_id = request.query.get("slot_id") or request.query.get("slot", "1")
     init_data = state.build_user_snapshot(user, slot_id=slot_id)
     await ws.send_str(json.dumps(init_data, ensure_ascii=False))
 
@@ -1861,6 +2131,48 @@ async def handle_admin_delete_key(request: web.Request):
     key_id = request.match_info.get("key")
     ok = storage.delete_user(api_key=key_id)
     return web.json_response({"status": "deleted" if ok else "not_found"})
+
+
+# =====================================================================
+# ADMIN HISTORY API ENDPOINTS
+# =====================================================================
+
+async def handle_admin_get_history(request: web.Request):
+    """Список файлов истории, размер и количество целей для админки."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    summary = history_manager.get_admin_summary()
+    return web.json_response(summary)
+
+async def handle_admin_delete_history(request: web.Request):
+    """Удаление помесячного файла истории."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    month_id = request.match_info.get("month")
+    ok = history_manager.delete_month(month_id)
+    return web.json_response({"status": "deleted" if ok else "not_found"})
+
+async def handle_admin_download_history(request: web.Request):
+    """Скачивание файла истории на ПК."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    month_id = request.match_info.get("month")
+    fp = history_manager.get_month_filepath(month_id)
+    if not fp: return web.json_response({"error": "File not found"}, status=404)
+    with open(fp, "r", encoding="utf-8") as f:
+        file_content = f.read()
+    return web.Response(
+        text=file_content,
+        content_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="flight_history_{month_id}.json"'}
+    )
+
+async def handle_admin_upload_history(request: web.Request):
+    """Загрузка внешнего JSON файла истории через админ-панель."""
+    if not is_admin(request): return web.json_response({"error": "Admin unauthorized"}, status=403)
+    try:
+        data = await request.json()
+        count = history_manager.import_external_history(data)
+        return web.json_response({"status": "success", "imported_targets": count})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
 
 async def handle_admin_backup(request: web.Request):
     """Экспорт полной базы пользователей и слотов в JSON-файл."""
@@ -2037,6 +2349,43 @@ ADMIN_HTML = """<!DOCTYPE html>
           </thead>
           <tbody id="keysTableBody" class="divide-y divide-gray-800">
             <tr><td colspan="6" class="p-8 text-center text-gray-500">Загрузка данных...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+
+    <!-- Панель управления архивом истории полетов -->
+    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden my-6 shadow-lg">
+      <div class="p-4 border-b border-gray-800 flex flex-wrap justify-between items-center gap-3">
+        <div>
+          <h2 class="font-semibold text-white flex items-center gap-2">
+            <span>📁 Архів історії польотів (Flight History)</span>
+            <span id="histTotalBadge" class="text-xs bg-sky-950 text-sky-400 border border-sky-800 px-2 py-0.5 rounded-full font-mono">0 МБ</span>
+          </h2>
+          <p class="text-xs text-gray-400 mt-0.5">Помісячне збереження траєкторій цілей, оптимізація під SD-карту та керування архівами</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="document.getElementById('histAdminFileInput').click()" class="bg-sky-600 hover:bg-sky-700 text-white px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1 transition" title="Завантажити JSON історії (наприклад, файл від друга)">📤 Додати JSON файл</button>
+          <input type="file" id="histAdminFileInput" accept=".json" class="hidden" onchange="uploadAdminHistory(event)">
+          <button onclick="loadAdminHistory()" class="bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 px-3 py-1.5 rounded text-xs font-semibold transition" title="Оновити список">🔄 Оновити</button>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm text-gray-400">
+          <thead class="bg-gray-950 text-gray-400 uppercase text-xs tracking-wider border-b border-gray-800">
+            <tr>
+              <th class="p-3">Місяць / Файл</th>
+              <th class="p-3">Дні у файлі</th>
+              <th class="p-3">Всього цілей</th>
+              <th class="p-3">Розмір на диску</th>
+              <th class="p-3">Останнє оновлення</th>
+              <th class="p-3 text-right">Дії</th>
+            </tr>
+          </thead>
+          <tbody id="histTableBody" class="divide-y divide-gray-800">
+            <tr><td colspan="6" class="p-8 text-center text-gray-500">Завантаження архівів...</td></tr>
           </tbody>
         </table>
       </div>
@@ -2826,6 +3175,98 @@ ADMIN_HTML = """<!DOCTYPE html>
       }
     }
 
+
+    async function loadAdminHistory() {
+      const tbody = document.getElementById("histTableBody");
+      const badge = document.getElementById("histTotalBadge");
+      if (!tbody) return;
+      try {
+        const res = await fetch("/api/v1/admin/history?admin_key=" + encodeURIComponent(currentAdminKey));
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        if (badge) {
+          badge.innerText = `${data.total_size_mb} (${data.total_targets} цілей)`;
+        }
+
+        if (!data.files || data.files.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="p-8 text-center text-gray-500">Архів історії порожній. Нові цілі будуть записуватися сюди автоматично кожні 5 хвилин.</td></tr>';
+          return;
+        }
+
+        let html = "";
+        data.files.forEach(f => {
+          const datesStr = f.dates && f.dates.length > 0 ? f.dates.join(", ") : "Немає";
+          const updatedStr = f.updated_at ? new Date(f.updated_at * 1000).toLocaleString() : "--";
+          
+          html += `
+            <tr class="hover:bg-gray-800/50 transition">
+              <td class="p-3 font-semibold text-white flex items-center gap-2">
+                <span class="text-sky-400">📅</span>
+                <span>${f.month}</span>
+                <span class="text-xs text-gray-500 font-mono">(${f.filename})</span>
+              </td>
+              <td class="p-3 text-xs text-gray-300 font-mono">${datesStr}</td>
+              <td class="p-3"><span class="bg-gray-800 text-amber-400 text-xs px-2 py-0.5 rounded font-mono font-bold">${f.total_targets}</span></td>
+              <td class="p-3 font-mono text-emerald-400 text-xs font-bold">${f.size_kb} КБ</td>
+              <td class="p-3 text-xs text-gray-400">${updatedStr}</td>
+              <td class="p-3 text-right space-x-2">
+                <button onclick="downloadHistoryFile('${f.month}')" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-2.5 py-1 rounded transition" title="Завантажити JSON на ПК">📥 Завантажити</button>
+                <button onclick="deleteHistoryFile('${f.month}')" class="text-xs bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-800/50 px-2.5 py-1 rounded transition" title="Видалити цей місяць">🗑️ Видалити</button>
+              </td>
+            </tr>
+          `;
+        });
+        tbody.innerHTML = html;
+      } catch (e) {
+        console.error("Error loading admin history:", e);
+      }
+    }
+
+    function downloadHistoryFile(month) {
+      window.location.href = "/api/v1/admin/history/download/" + encodeURIComponent(month) + "?admin_key=" + encodeURIComponent(currentAdminKey);
+    }
+
+    async function deleteHistoryFile(month) {
+      if (!confirm(`Ви дійсно бажаєте видалити файл історії за ${month}? Цю дію неможливо скасувати.`)) return;
+      try {
+        const res = await fetch("/api/v1/admin/history/" + encodeURIComponent(month) + "?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "DELETE"
+        });
+        if (res.ok) {
+          loadAdminHistory();
+        } else {
+          alert("Помилка при видаленні файлу!");
+        }
+      } catch (e) {
+        alert("Помилка з'єднання: " + e);
+      }
+    }
+
+    async function uploadAdminHistory(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const json = JSON.parse(text);
+        const res = await fetch("/api/v1/admin/history/upload?admin_key=" + encodeURIComponent(currentAdminKey), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(json)
+        });
+        const resp = await res.json();
+        if (res.ok) {
+          alert(`Успішно імпортовано ${resp.imported_targets} цілей в архів!`);
+          loadAdminHistory();
+        } else {
+          alert("Помилка імпорту: " + (resp.error || "Невідома помилка"));
+        }
+      } catch (e) {
+        alert("Помилка читання JSON: " + e);
+      }
+      event.target.value = "";
+    }
+
     function downloadBackup() {
       if (!currentAdminKey) return showLoginScreen();
       window.location.href = "/api/v1/admin/backup?admin_key=" + encodeURIComponent(currentAdminKey);
@@ -2869,6 +3310,311 @@ async def handle_admin_dashboard(request: web.Request):
         return web.Response(text="404: Not Found", status=404)
     return web.Response(
         text=ADMIN_HTML,
+        content_type="text/html",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+
+RADAR_MAP_HTML = """<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Тактичний Радар Повітряних Загроз</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #0b0f19; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #fff; }
+    #map { width: 100%; height: 100%; background: #0b0f19; }
+    
+    /* HUD Overlay */
+    .hud-top {
+      position: absolute; top: 12px; left: 12px; right: 12px;
+      display: flex; justify-content: space-between; align-items: center;
+      z-index: 1000; pointer-events: none;
+    }
+    .hud-card {
+      background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px;
+      padding: 8px 14px; pointer-events: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      display: flex; align-items: center; gap: 12px;
+    }
+    .hud-title { font-size: 13px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: #38bdf8; }
+    .badge { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    .badge-red { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+    .badge-green { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid #22c55e; }
+    .badge-yellow { background: rgba(234, 179, 8, 0.2); color: #facc15; border: 1px solid #eab308; }
+    
+    /* Target Markers */
+    .target-marker { background: none; border: none; }
+    .leaflet-popup-content-wrapper {
+      background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(8px);
+      color: #fff; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px;
+    }
+    .leaflet-popup-tip { background: rgba(15, 23, 42, 0.95); }
+    .popup-title { font-size: 14px; font-weight: 800; color: #fb923c; margin-bottom: 4px; }
+    .popup-row { font-size: 12px; color: #94a3b8; display: flex; justify-content: space-between; gap: 12px; margin-top: 2px; }
+    .popup-val { color: #f8fafc; font-weight: 600; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <div class="hud-top">
+    <div class="hud-card">
+      <span class="hud-title">⚡ Повітряний Радар</span>
+      <span id="threatsBadge" class="badge badge-green">Цілей: 0</span>
+      <span id="migBadge" class="badge badge-green">МіГ-31К: Чисто</span>
+    </div>
+    <div class="hud-card" id="closestCard" style="display: none;">
+      <span style="font-size: 12px; color: #94a3b8;">Найближча:</span>
+      <span id="closestInfo" style="font-size: 12px; font-weight: 700; color: #fb923c;">--</span>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const token = urlParams.get('token') || localStorage.getItem('hub_user_token') || '';
+    if (urlParams.get('token')) localStorage.setItem('hub_user_token', token);
+
+    const map = L.map('map', {
+      center: [48.5, 31.2],
+      zoom: 6,
+      zoomControl: false,
+      attributionControl: false
+    });
+
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    // Dark tactical basemap (CartoDB Dark Matter)
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      maxZoom: 18,
+      subdomains: 'abcd'
+    }).addTo(map);
+
+    let threatLayers = {};   // id -> { marker, heatTrail, futureCorridor }
+    let slotLayers = {};     // slot_id -> { marker, circle }
+
+    function getTargetSvg(t) {
+      const heading = t.heading || t.bearing_deg || 0;
+      const cat = (t.category || 'shahed').toLowerCase();
+      let silhouette = '';
+      let glowRx = 9, glowRy = 16;
+
+      if (cat.includes('kab') || (t.type && t.type.includes('КАБ'))) {
+        silhouette = '<path fill=\"#FFFFFF\" stroke=\"#111827\" stroke-width=\"1.8\" stroke-linejoin=\"round\" d=\"M24 7 C21 7, 19 11, 19 16 L19 23 L9 26 L9 29 L19 29 L19 33 L14 38 L16 38 L20 35 L20 39 L28 39 L28 35 L32 38 L34 38 L29 33 L29 29 L39 29 L39 26 L29 23 L29 16 C29 11, 27 7, 24 7 Z\"/><circle cx=\"24\" cy=\"18\" r=\"2.2\" fill=\"#E11D48\"/>';
+        glowRx = 8; glowRy = 14;
+      } else if (cat.includes('missile') || (t.type && t.type.includes('ракет'))) {
+        silhouette = '<path fill=\"#FFFFFF\" stroke=\"#111827\" stroke-width=\"1.8\" stroke-linejoin=\"round\" d=\"M24 6 L22 13 L22 21 L11 27 L13 28 L22 26 L22 33 L16 38 L18 38 L22 36 L22 39 L26 39 L26 36 L30 38 L32 38 L26 33 L26 26 L35 28 L37 27 L26 21 L26 13 Z\"/><polygon points=\"23,39 24,46 25,39\" fill=\"#FFEA00\" stroke=\"#FF5722\" stroke-width=\"0.8\"/>';
+        glowRx = 7; glowRy = 17;
+      } else {
+        // Shahed-136 delta wing (identical to screenshot 3)
+        silhouette = '<path fill=\"#FFFFFF\" stroke=\"#111827\" stroke-width=\"1.8\" stroke-linejoin=\"round\" d=\"M24 10 L12 28 L12 24 L10 24 L10 32 L12 32 L12 30 L21 28 L21 34 L27 34 L27 28 L36 30 L36 32 L38 32 L38 24 L36 24 L36 28 Z\"/><circle cx=\"24\" cy=\"34\" r=\"1.5\" fill=\"#111827\"/>';
+      }
+
+      return `<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\" width=\"48\" height=\"48\">
+        <defs>
+          <radialGradient id=\"heatGlow\" cx=\"50%\" cy=\"30%\" r=\"55%\" fx=\"50%\" fy=\"30%\">
+            <stop offset=\"0%\" stop-color=\"#FF3D00\" stop-opacity=\"0.9\"/>
+            <stop offset=\"35%\" stop-color=\"#FF6D00\" stop-opacity=\"0.6\"/>
+            <stop offset=\"70%\" stop-color=\"#FF9800\" stop-opacity=\"0.28\"/>
+            <stop offset=\"100%\" stop-color=\"#FF5722\" stop-opacity=\"0\"/>
+          </radialGradient>
+        </defs>
+        <g transform=\"rotate(${heading.toFixed(1)} 24 24)\">
+          <ellipse cx=\"24\" cy=\"30\" rx=\"${glowRx}\" ry=\"${glowRy}\" fill=\"url(#heatGlow)\"/>
+          ${silhouette}
+        </g>
+      </svg>`;
+    }
+
+    function updateRadarData(data) {
+      if (!data) return;
+
+      // Update HUD
+      const count = data.active_threats_total || (data.threats ? data.threats.length : 0);
+      const tBadge = document.getElementById('threatsBadge');
+      tBadge.innerText = `Цілей: ${count}`;
+      tBadge.className = count > 0 ? 'badge badge-red' : 'badge badge-green';
+
+      const migActive = data.general_alerts && data.general_alerts.mig31k_active;
+      const mBadge = document.getElementById('migBadge');
+      mBadge.innerText = migActive ? '⚠️ МіГ-31К: ЗЛІТ' : 'МіГ-31К: Чисто';
+      mBadge.className = migActive ? 'badge badge-red' : 'badge badge-green';
+
+      const closest = data.closest_threat;
+      const cCard = document.getElementById('closestCard');
+      if (closest && closest.distance_km) {
+        cCard.style.display = 'flex';
+        document.getElementById('closestInfo').innerText = `${closest.type} (${closest.distance_km} км, ETA: ${closest.eta_minutes || '--'} хв)`;
+      } else {
+        cCard.style.display = 'none';
+      }
+
+      // Update User Slots (Home / Danger circles)
+      if (data.slots) {
+        for (const [sId, s] of Object.entries(data.slots)) {
+          if (!slotLayers[sId]) {
+            const circle = L.circle([s.lat, s.lon], {
+              radius: (s.danger_radius_km || 15) * 1000,
+              color: '#ef4444',
+              fillColor: '#ef4444',
+              fillOpacity: 0.12,
+              weight: 1.5,
+              dashArray: '4, 4'
+            }).addTo(map);
+
+            const sMarker = L.circleMarker([s.lat, s.lon], {
+              radius: 6,
+              color: '#38bdf8',
+              fillColor: '#0284c7',
+              fillOpacity: 1,
+              weight: 2
+            }).bindTooltip(`<b>${s.name}</b> (${s.danger_radius_km || 15} км)`, { permanent: false, direction: 'top' }).addTo(map);
+
+            slotLayers[sId] = { circle, marker: sMarker };
+          }
+        }
+      }
+
+      // Update Threats & Trajectories
+      const activeIds = new Set();
+      const threats = data.threats || [];
+
+      for (const t of threats) {
+        activeIds.add(t.id);
+        const lat = t.lat;
+        const lon = t.lon;
+
+        // Extract trajectory points
+        const trajPoints = (t.trajectory || []).map(p => [p.lat, p.lon]);
+        if (trajPoints.length === 0 || (trajPoints[trajPoints.length-1][0] !== lat || trajPoints[trajPoints.length-1][1] !== lon)) {
+          trajPoints.push([lat, lon]);
+        }
+
+        // Extract extrapolated corridor points
+        const extraPoints = [[lat, lon]].concat((t.extrapolated_path || []).map(p => [p.lat, p.lon]));
+
+        const svgHtml = getTargetSvg(t);
+        const icon = L.divIcon({
+          html: svgHtml,
+          className: 'target-marker',
+          iconSize: [48, 48],
+          iconAnchor: [24, 24]
+        });
+
+        const popupContent = `
+          <div class="popup-title">🎯 ${t.type}</div>
+          <div class="popup-row"><span>Дистанція:</span><span class="popup-val">${t.distance_km || '--'} км</span></div>
+          <div class="popup-row"><span>Курс:</span><span class="popup-val">${t.heading || '--'}°</span></div>
+          <div class="popup-row"><span>Швидкість:</span><span class="popup-val">${t.speed_kmh || '--'} км/год</span></div>
+          <div class="popup-row"><span>Час підльоту (ETA):</span><span class="popup-val">${t.eta_minutes ? t.eta_minutes + ' хв' : '--'}</span></div>
+          <div class="popup-row"><span>Область:</span><span class="popup-val">${t.oblast || '--'}</span></div>
+        `;
+
+        if (!threatLayers[t.id]) {
+          // Heat trail polyline (glow + central path)
+          const glowTrail = L.polyline(trajPoints, {
+            color: '#ff3d00',
+            weight: 10,
+            opacity: 0.35,
+            lineCap: 'round',
+            lineJoin: 'round'
+          }).addTo(map);
+
+          const coreTrail = L.polyline(trajPoints, {
+            color: '#facc15',
+            weight: 2.5,
+            opacity: 0.85,
+            lineCap: 'round',
+            lineJoin: 'round'
+          }).addTo(map);
+
+          // Future extrapolated flight corridor (dashed)
+          const futureLine = L.polyline(extraPoints, {
+            color: '#fb923c',
+            weight: 2,
+            opacity: 0.6,
+            dashArray: '5, 8'
+          }).addTo(map);
+
+          // Target marker
+          const marker = L.marker([lat, lon], { icon }).bindPopup(popupContent).addTo(map);
+
+          threatLayers[t.id] = { marker, glowTrail, coreTrail, futureLine };
+        } else {
+          // Update existing
+          const item = threatLayers[t.id];
+          item.marker.setLatLng([lat, lon]);
+          item.marker.setIcon(icon);
+          item.marker.setPopupContent(popupContent);
+          item.glowTrail.setLatLngs(trajPoints);
+          item.coreTrail.setLatLngs(trajPoints);
+          item.futureLine.setLatLngs(extraPoints);
+        }
+      }
+
+      // Remove vanished threats
+      for (const [id, item] of Object.entries(threatLayers)) {
+        if (!activeIds.has(id)) {
+          map.removeLayer(item.marker);
+          map.removeLayer(item.glowTrail);
+          map.removeLayer(item.coreTrail);
+          map.removeLayer(item.futureLine);
+          delete threatLayers[id];
+        }
+      }
+    }
+
+    // Connect via WebSocket or Poll
+    function connectStream() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${proto}//${location.host}/api/v1/stream?token=${encodeURIComponent(token)}`;
+      const ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const data = json.parse(event.data);
+          updateRadarData(data);
+        } catch (e) { console.error('WS Parse error', e); }
+      };
+
+      ws.onclose = () => {
+        setTimeout(connectStream, 3000);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    }
+
+    // Fallback polling
+    async function pollFallback() {
+      try {
+        const res = await fetch(`/api/v1/threats?token=${encodeURIComponent(token)}`);
+        if (res.ok) {
+          const data = await res.json();
+          updateRadarData(data);
+        }
+      } catch (e) {}
+    }
+
+    connectStream();
+    setInterval(pollFallback, 5000);
+  </script>
+</body>
+</html>
+"""
+
+async def handle_radar_map(request: web.Request):
+    """Интерактивная живая карта радара с тепловыми следами и прогнозом траектории."""
+    return web.Response(
+        text=RADAR_MAP_HTML,
         content_type="text/html",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -2928,7 +3674,60 @@ def create_app() -> web.Application:
     app.router.add_post("/api/v1/settings", handle_update_settings)
     app.router.add_get("/api/v1/threats", handle_get_threats)
     app.router.add_get("/api/v1/radar", handle_get_radar)
+    
+# =====================================================================
+# API ЕНДПОІНТИ ДЛЯ GEOJSON РЕГІОНІВ ТА ІСТОРІЇ ПОЛЬОТІВ
+# =====================================================================
+
+async def handle_get_regions_geojson(request: web.Request):
+    """Повертає оптимізований GeoJSON 26 областей України для карти."""
+    for fn in ["ukraine_oblasts_compact.geojson", "ukraine_oblasts.geojson"]:
+        geojson_path = os.path.join(DATA_DIR, fn)
+        if os.path.exists(geojson_path):
+            with open(geojson_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return web.json_response(data, headers={"Cache-Control": "public, max-age=86400"})
+    return web.json_response({"error": "GeoJSON not found"}, status=404)
+
+async def handle_get_history_months(request: web.Request):
+    """Повертає список доступних місяців та дат в архіві історії."""
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    months = history_manager.get_available_months()
+    return web.json_response({"status": "ok", "months": months})
+
+async def handle_get_history(request: web.Request):
+    """Повертає історію польотів за місяць або конкретну дату."""
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    month = request.query.get("month")
+    date = request.query.get("date")
+    if not month and not date:
+        now_dt = time.gmtime()
+        month = time.strftime("%Y-%m", now_dt)
+    elif not month and date:
+        month = date[:7]
+    data = history_manager.get_history(month, date_str=date)
+    return web.json_response(data)
+
+async def handle_upload_history(request: web.Request):
+    """Імпорт зовнішнього JSON файлу з історією польотів."""
+    user = get_authenticated_user(request)
+    if not user: return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        count = history_manager.import_external_history(data)
+        return web.json_response({"status": "ok", "imported_targets": count})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
     app.router.add_get("/api/v1/map", handle_get_map)
+    app.router.add_get("/api/v1/regions/geojson", handle_get_regions_geojson)
+    app.router.add_get("/api/v1/history/months", handle_get_history_months)
+    app.router.add_get("/api/v1/history", handle_get_history)
+    app.router.add_post("/api/v1/history/upload", handle_upload_history)
+    app.router.add_get("/map", handle_radar_map)
+    app.router.add_get("/radar-map", handle_radar_map)
     app.router.add_get("/api/v1/stream", handle_websocket_stream)
 
     app.router.add_get("/admin", handle_admin_dashboard)
@@ -2939,6 +3738,10 @@ def create_app() -> web.Application:
     app.router.add_put("/api/v1/admin/keys/{key}", handle_admin_update_key)
     app.router.add_put("/api/v1/admin/keys/{key}/settings", handle_admin_update_user_settings)
     app.router.add_delete("/api/v1/admin/keys/{key}", handle_admin_delete_key)
+    app.router.add_get("/api/v1/admin/history", handle_admin_get_history)
+    app.router.add_delete("/api/v1/admin/history/{month}", handle_admin_delete_history)
+    app.router.add_get("/api/v1/admin/history/download/{month}", handle_admin_download_history)
+    app.router.add_post("/api/v1/admin/history/upload", handle_admin_upload_history)
     app.router.add_get("/api/v1/admin/backup", handle_admin_backup)
     app.router.add_post("/api/v1/admin/restore", handle_admin_restore)
 
