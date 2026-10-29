@@ -454,6 +454,15 @@ TARGET_METADATA = {
         "is_drone": False,
         "color_hex": "#FB923C"
     },
+    "lancet": {
+        "name_ua": "Ланцет",
+        "name_en": "Lancet",
+        "ha_icon": "mdi:navigation-variant-outline",
+        "esp_code": 8,
+        "default_speed": 110.0,
+        "is_drone": True,
+        "color_hex": "#F43F5E"
+    },
     "recon": {
         "name_ua": "Розвідник",
         "name_en": "Reconnaissance UAV",
@@ -471,6 +480,24 @@ TARGET_METADATA = {
         "default_speed": 120.0,
         "is_drone": True,
         "color_hex": "#F43F5E"
+    },
+    "aviation": {
+        "name_ua": "Авіація",
+        "name_en": "Tactical aviation",
+        "ha_icon": "mdi:airplane-alert",
+        "esp_code": 9,
+        "default_speed": 750.0,
+        "is_drone": False,
+        "color_hex": "#E11D48"
+    },
+    "artillery": {
+        "name_ua": "Артилерія / РСЗВ",
+        "name_en": "Artillery / MLRS",
+        "ha_icon": "mdi:ammunition",
+        "esp_code": 10,
+        "default_speed": 0.0,
+        "is_drone": False,
+        "color_hex": "#DC2626"
     },
     "unknown": {
         "name_ua": "Ціль не визначена",
@@ -495,10 +522,16 @@ def classify_target(raw_type: str, raw_code: int = 0) -> tuple[str, dict]:
     if "banderol" in s or "бандероль" in s or s == "ic_banderol" or "decoy" in s:
         return "banderol", TARGET_METADATA["banderol"]
 
-    if ("jet" in s and "shahed" in s) or "реактив" in s or s in ("ic_shahed_jet", "ic_shahed_jet_mesh", "uav_jet"):
+    # 1. Ударний БПЛА Ланцет
+    if "lancet" in s or "ланцет" in s or "ic_lancet" in s:
+        return "lancet", TARGET_METADATA["lancet"]
+
+    # 2. Реактивний шахед (Shahed-238 / Jet / Реакт.уд.дрон)
+    if ("jet" in s) or ("реакт" in s) or ("238" in s) or s in ("ic_shahed_jet", "ic_shahed_jet_mesh", "uav_jet"):
         return "shahed_jet", TARGET_METADATA["shahed_jet"]
 
-    if "shahed" in s or "шахед" in s or s in ("ic_shahed", "ic_shahed_mesh"):
+    # 3. Класичний шахед (Shahed-136)
+    if "shahed" in s or "шахед" in s or "геран" in s or s in ("ic_shahed", "ic_shahed_mesh"):
         return "shahed", TARGET_METADATA["shahed"]
 
     if "kab" in s or "каб" in s or "airbomb" in s or s == "ic_airbomb":
@@ -507,14 +540,21 @@ def classify_target(raw_type: str, raw_code: int = 0) -> tuple[str, dict]:
     if "missile" in s or "ракета" in s or "ballistic" in s or "баліст" in s or "kinzhal" in s or s in ("ic_missile", "ic_ballistic") or raw_code in (3, 100, 101, 102, 103, 104, 105, 106, 107):
         return "missile", TARGET_METADATA["missile"]
 
-    if "fpv" in s:
+    if "fpv" in s or "фпв" in s or "молнія" in s or "молния" in s:
         return "fpv", TARGET_METADATA["fpv"]
 
-    if any(k in s for k in ("zala", "supercam", "lancet", "mohajer", "recon", "розвід", "ланцет")):
+    # 4. БПЛА-розвідники (Zala, Supercam, Orlan, Mohajer тощо)
+    if any(k in s for k in ("zala", "зала", "supercam", "суперкам", "orlan", "орлан", "mohajer", "мохаджер", "recon", "розвід", "розвідник", "розвід. дрон", "розвідка")):
         return "recon", TARGET_METADATA["recon"]
 
     if s in ("ic_air_threat_combined_white", "ic_asterix_plane_stroke", "ic_asterix_plane_masked", "unknown", "ціль не визначена", "не визначена") or raw_code in (116, 200):
         return "unknown", TARGET_METADATA["unknown"]
+
+    if any(k in s for k in ("авіац", "aviation", "літак", "су-34", "су-35", "ту-95", "ту-22", "міг-31")):
+        return "aviation", TARGET_METADATA["aviation"]
+
+    if any(k in s for k in ("арт", "артилер", "рсзв", "град", "ураган", "смерч")):
+        return "artillery", TARGET_METADATA["artillery"]
 
     if "drone" in s or "бпла" in s or "uav" in s or raw_code in (8, 11):
         return "shahed", TARGET_METADATA["shahed"]
@@ -566,7 +606,7 @@ class TargetTrack:
         self.first_seen = time.time()
         self.last_seen = time.time()
         # История точек для построения теплового следа / пройденного пути
-        self.trajectory = [{"lat": round(lat, 5), "lon": round(lon, 5), "ts": int(self.last_seen)}]
+        self.trajectory = [{"lat": float(lat), "lon": float(lon), "ts": int(self.last_seen)}]
 
     def update(self, lat: float, lon: float, heading: float, speed_kmh: float, oblast: str, oblast_id: str, t_type: str = None, raw_code: int = None):
         now = time.time()
@@ -575,7 +615,7 @@ class TargetTrack:
 
         # Добавляем точку в трек при смещении > 300 м или раз в 10 секунд
         if dist_from_last > 0.3 or (now - last_pt["ts"]) >= 10.0:
-            self.trajectory.append({"lat": round(lat, 5), "lon": round(lon, 5), "ts": int(now)})
+            self.trajectory.append({"lat": float(lat), "lon": float(lon), "ts": int(now)})
             if len(self.trajectory) > 30: # храним до 30 последних точек
                 self.trajectory.pop(0)
 
@@ -618,8 +658,8 @@ class TargetTrack:
             lambda2 = lambda1 + math.atan2(math.sin(brng) * math.sin(d / R) * math.cos(phi1), math.cos(d / R) - math.sin(phi1) * math.sin(phi2))
             corridor.append({
                 "minutes_ahead": m,
-                "lat": round(math.degrees(phi2), 5),
-                "lon": round(math.degrees(lambda2), 5)
+                "lat": math.degrees(phi2),
+                "lon": math.degrees(lambda2)
             })
         return corridor
 
@@ -720,8 +760,8 @@ class HistoryManager:
         entry = self.active_tracks[tid]
         entry["end_time"] = int(now)
 
-        lat = round(trk.lat, 4)
-        lon = round(trk.lon, 4)
+        lat = float(trk.lat)
+        lon = float(trk.lon)
         heading = round(trk.heading, 1)
         speed = round(trk.speed_kmh, 1)
 
@@ -972,8 +1012,8 @@ class HistoryManager:
                 elif isinstance(p, dict):
                     c_path.append([
                         p.get("time", 0),
-                        round(float(p.get("lat", 0)), 4),
-                        round(float(p.get("lon", 0)), 4),
+                        float(p.get("lat", 0)),
+                        float(p.get("lon", 0)),
                         round(float(p.get("heading", 0)), 1),
                         round(float(p.get("speed", 185.0)), 1)
                     ])
@@ -1155,6 +1195,7 @@ class ThreatState:
         self.artillery_alerts = set()
         self.alert_reasons = []
         self.oblast_alerts = {} # oblast_id -> status dict
+        self.raion_alerts = {}  # raion_id -> status dict (Rank 2)
         self.recompute_oblast_alerts()
 
     def recompute_oblast_alerts(self):
@@ -1172,55 +1213,78 @@ class ThreatState:
                 "targets_count": 0
             }
 
-        # 1. Анализ официальных сирен и районов
+        raion_status = {}
+        # 1. Анализ официальных сирен (области Rank 1 и районы Rank 2)
         for rid, a_info in self.official_alerts.items():
             ob_id = oblast_detector.get_oblast_id_by_region(rid)
-            if ob_id not in ob_status:
-                continue
-            ob = ob_status[ob_id]
-            ob["alert"] = True
-            if not ob["since"] and a_info.get("since"):
-                ob["since"] = a_info["since"]
+            a_type = a_info.get("type", "")
+            is_raion = (rid in getattr(oblast_detector, "raions_by_id", {})) or (a_type in ("District", "Raion"))
+
+            r_alert_type = "missile"
+            r_color = "red"
+            r_reasons = []
 
             active_alerts = a_info.get("alerts", [])
-            if not active_alerts:
-                if ob["alert_type"] == "none":
-                    ob["alert_type"] = "missile"
-                    ob["color"] = "red"
-
             for al in active_alerts:
                 al_type = al.get("type", "")
                 levels = al.get("activeAlertLevels", [])
                 for lvl in levels:
                     lvl_level = str(lvl.get("alertLevel", "")).strip().capitalize()
                     reason = lvl.get("reason", "")
-                    if reason and reason not in ob["reasons"]:
-                        ob["reasons"].append(reason)
-
-                    # Прямая проверка поля alertLevel из mapUpdate ("Yellow" / "Red"):
+                    if reason and reason not in r_reasons:
+                        r_reasons.append(reason)
                     if lvl_level == "Yellow":
-                        if ob["alert_type"] != "missile":
-                            ob["alert_type"] = "drone"
-                            ob["color"] = "yellow"
+                        if r_alert_type != "missile":
+                            r_alert_type = "drone"
+                            r_color = "yellow"
                     elif lvl_level == "Red":
-                        ob["alert_type"] = "missile"
-                        ob["color"] = "red"
+                        r_alert_type = "missile"
+                        r_color = "red"
                     else:
-                        # Резервный анализ по тексту причины:
                         r_lower = reason.lower()
                         if "дрон" in r_lower or "бпла" in r_lower or "жовт" in r_lower:
-                            if ob["alert_type"] != "missile":
-                                ob["alert_type"] = "drone"
-                                ob["color"] = "yellow"
+                            if r_alert_type != "missile":
+                                r_alert_type = "drone"
+                                r_color = "yellow"
                         elif "ракет" in r_lower or "баліст" in r_lower or "червон" in r_lower or "авіац" in r_lower or "каб" in r_lower:
-                            ob["alert_type"] = "missile"
-                            ob["color"] = "red"
+                            r_alert_type = "missile"
+                            r_color = "red"
                 if al_type in ("ARTILLERY", "URBAN_FIGHTS") or rid in self.artillery_alerts:
-                    ob["alert_type"] = "missile"
-                    ob["color"] = "red"
-                elif ob["alert_type"] == "none":
-                    ob["alert_type"] = "missile"
-                    ob["color"] = "red"
+                    r_alert_type = "missile"
+                    r_color = "red"
+
+            if is_raion:
+                r_meta = getattr(oblast_detector, "raions_by_id", {}).get(rid, {})
+                r_name = r_meta.get("name") or a_info.get("name", "")
+                raion_status[rid] = {
+                    "id": rid,
+                    "regionId": rid,
+                    "name": r_name,
+                    "rank": 2,
+                    "oblast_id": ob_id,
+                    "alert": True,
+                    "alert_type": r_alert_type,
+                    "color": r_color,
+                    "reasons": r_reasons,
+                    "since": a_info.get("since", ""),
+                    "targets_count": 0
+                }
+
+            if ob_id in ob_status:
+                ob = ob_status[ob_id]
+                if not is_raion or a_type == "State":
+                    ob["alert"] = True
+                    if not ob["since"] and a_info.get("since"):
+                        ob["since"] = a_info["since"]
+                    for rz in r_reasons:
+                        if rz not in ob["reasons"]:
+                            ob["reasons"].append(rz)
+                    if r_color == "red":
+                        ob["alert_type"] = "missile"
+                        ob["color"] = "red"
+                    elif r_color == "yellow" and ob["alert_type"] != "missile":
+                        ob["alert_type"] = "drone"
+                        ob["color"] = "yellow"
 
         # 2. Анализ летящих целей в небе (Centrifugo / TargetTracker)
         for trk in self.tracker.tracks.values():
@@ -1242,18 +1306,19 @@ class ThreatState:
                     ob["color"] = "red"
 
         self.oblast_alerts = ob_status
+        self.raion_alerts = raion_status
 
     def build_map_snapshot(self) -> dict:
         """Снапшот стратегической карты Украины для ESP32 и дашбордов."""
         if not self.oblast_alerts:
             self.recompute_oblast_alerts()
-        oblasts_list = list(self.oblast_alerts.values())
+        oblasts_list = list(self.oblast_alerts.values()) + list(self.raion_alerts.values())
         targets_list = []
         for trk in self.tracker.tracks.values():
             targets_list.append({
                 "trk_id": trk.id,
-                "lat": round(trk.lat, 4),
-                "lon": round(trk.lon, 4),
+                "lat": trk.lat,
+                "lon": trk.lon,
                 "heading_deg": round(trk.heading, 1),
                 "speed_kmh": round(trk.speed_kmh, 1),
                 "type": trk.type,
@@ -1320,17 +1385,32 @@ class ThreatState:
                             }]
                         }]
                     }
-            # 2. Анализируем районы
+            # 2. Анализируем районы (точечная привязка по районам Rank 2)
             for r_item in neptun_data.get("raions", []):
-                ob_name = r_item.get("oblast", "")
-                ob_id = oblast_detector.get_oblast_id_by_name(ob_name)
-                if ob_id and ob_id != "0":
-                    lvl = "Yellow" if str(r_item.get("level", "")).lower() == "yellow" else "Red"
-                    reason = (r_item.get("reasons") or [""])[0] if r_item.get("reasons") else ""
-                    if ob_id not in active:
+                r_name = r_item.get("name", "")
+                r_id = oblast_detector.get_raion_id_by_name(r_name)
+                lvl = "Yellow" if str(r_item.get("level", "")).lower() == "yellow" else "Red"
+                reason = (r_item.get("reasons") or [""])[0] if r_item.get("reasons") else ""
+                if r_id and r_id != "0":
+                    active[r_id] = {
+                        "name": r_name,
+                        "type": "District",
+                        "since": r_item.get("since", ""),
+                        "alerts": [{
+                            "type": "AIR",
+                            "activeAlertLevels": [{
+                                "alertLevel": lvl,
+                                "reason": reason
+                            }]
+                        }]
+                    }
+                else:
+                    ob_name = r_item.get("oblast", "")
+                    ob_id = oblast_detector.get_oblast_id_by_name(ob_name)
+                    if ob_id and ob_id != "0" and ob_id not in active:
                         active[ob_id] = {
                             "name": ob_name,
-                            "type": "Raion", # Не підміняємо район на цілу область!
+                            "type": "District",
                             "since": r_item.get("since", ""),
                             "alerts": [{
                                 "type": "AIR",
@@ -1340,13 +1420,6 @@ class ThreatState:
                                 }]
                             }]
                         }
-                    else:
-                        # Если в районе красный уровень, поднимаем статус всей области до Red
-                        if lvl == "Red":
-                            active[ob_id]["alerts"][0]["activeAlertLevels"] = [{
-                                "alertLevel": "Red",
-                                "reason": reason
-                            }]
             self.official_alerts = active
             self.recompute_oblast_alerts()
 
@@ -1433,8 +1506,8 @@ class ThreatState:
                 "color_hex": getattr(t, "color_hex", "#FACC15"),
                 "raw_code": t.raw_code,
                 "oblast": t.oblast,
-                "lat": round(lat, 5),
-                "lon": round(lon, 5),
+                "lat": lat,
+                "lon": lon,
                 "distance_km": round(dist, 1),
                 "bearing_deg": round(bearing, 1),
                 "bearing_sector": bearing_to_compass(bearing),
@@ -1586,8 +1659,9 @@ class ThreatState:
             "closest_threat": closest_threat,
             "slots": user_slots_stats,
             "threats": processed,
-            "map_oblasts": list(self.oblast_alerts.values()) if self.oblast_alerts else [],
-            "oblasts": list(self.oblast_alerts.values()) if self.oblast_alerts else []
+            "map_oblasts": list(self.oblast_alerts.values()) + list(self.raion_alerts.values()) if (self.oblast_alerts or self.raion_alerts) else [],
+            "oblasts": list(self.oblast_alerts.values()) + list(self.raion_alerts.values()) if (self.oblast_alerts or self.raion_alerts) else [],
+            "raions": list(self.raion_alerts.values()) if self.raion_alerts else []
         }
 
     def build_radar_projection(self, user: dict, slot_id: str = "1", radius_km: float = 100.0,
@@ -1838,10 +1912,13 @@ def extract_targets(decoded_data):
             if c_idx < len(found_coords):
                 lon = MIN_LON + (found_coords[c_idx][0] * LON_RANGE)
                 lat = MAX_LAT - (found_coords[c_idx][1] * LAT_RANGE)
-                name = found_types[typ_idx][1] if typ_idx < len(found_types) else "Ціль"
-                raw_code = found_types[typ_idx][0] if typ_idx < len(found_types) else 0
+                type_row = found_types[typ_idx] if typ_idx < len(found_types) else [0, "Ціль"]
+                raw_code = type_row[0] if len(type_row) > 0 and isinstance(type_row[0], int) else 0
+                type_strings = " ".join([str(x) for x in type_row if isinstance(x, str)])
+                raw_name = type_row[1] if len(type_row) > 1 and isinstance(type_row[1], str) else "Ціль"
 
-                cat, meta = classify_target(name, raw_code)
+                cat, meta = classify_target(type_strings or raw_name, raw_code)
+                target_display_name = meta["name_ua"]
                 speed = meta["default_speed"]
                 ob_info = oblast_detector.find_oblast_info(lat, lon)
 
@@ -1849,7 +1926,7 @@ def extract_targets(decoded_data):
                     "id": uid,
                     "lat": lat,
                     "lon": lon,
-                    "type": name,
+                    "type": target_display_name,
                     "category": cat,
                     "raw_type_code": raw_code,
                     "oblast": ob_info["name"],
@@ -1997,15 +2074,27 @@ async def run_failover_neptun_collector():
                         lat = float(t.get("lat") or 0.0)
                         lon = float(t.get("lon") or 0.0)
                         heading = float(t.get("heading") or 0.0)
-                        raw_type = t.get("type", "uav")
+                        trail = t.get("trail") or []
+                        if (heading == 0.0 or heading is None) and len(trail) >= 2:
+                            try:
+                                p_prev = trail[-2]
+                                p_curr = trail[-1]
+                                heading = calculate_bearing(float(p_prev["lat"]), float(p_prev["lon"]), float(p_curr["lat"]), float(p_curr["lon"]))
+                            except Exception: pass
+
+                        raw_type = str(t.get("type") or "uav")
+                        title = str(t.get("title") or "")
+                        expl = str(t.get("explanationShort") or "")
+                        raw_combined = f"{raw_type} {title} {expl}".strip()
                         raw_code = 8 if raw_type == "uav" else (3 if raw_type in ("missile", "ballistic") else 0)
-                        cat, meta = classify_target(raw_type, raw_code)
+                        cat, meta = classify_target(raw_combined, raw_code)
+                        target_display_name = meta["name_ua"]
                         ob_info = oblast_detector.find_oblast_info(lat, lon)
                         normalized.append({
                             "id": t.get("id", f"nep_{lat:.2f}"),
                             "lat": lat,
                             "lon": lon,
-                            "type": raw_type,
+                            "type": target_display_name,
                             "category": cat,
                             "raw_type_code": raw_code,
                             "oblast": ob_info["name"],
