@@ -1504,6 +1504,8 @@ class ThreatState:
             "general_alerts": {
                 "mig31k_active": self.mig_active,
                 "total_official_sirens": len(self.official_alerts),
+                "active_oblasts_count": sum(1 for a in self.official_alerts.values() if a.get("type") == "State") or sum(1 for ob in self.oblast_alerts.values() if ob.get("alert")),
+                "active_raions_count": sum(1 for a in self.official_alerts.values() if a.get("type") != "State"),
                 "reasons": self.alert_reasons
             },
             "current_point": {
@@ -2558,7 +2560,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         <div id="statThreats" class="text-2xl font-bold text-red-400 mt-1">--</div>
       </div>
       <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
-        <div class="text-xs text-gray-400">Официальных сирен (области)</div>
+        <div class="text-xs text-gray-400">Офіційних сирен</div>
         <div id="statSirens" class="text-2xl font-bold text-yellow-400 mt-1">--</div>
       </div>
       <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
@@ -3049,7 +3051,17 @@ ADMIN_HTML = """<!DOCTYPE html>
         const hData = await hRes.json();
 
         document.getElementById("statThreats").innerText = hData.active_threats_count ?? "--";
-        document.getElementById("statSirens").innerText = hData.official_sirens_count ?? "--";
+        const oblCount = hData.active_oblasts_count ?? 0;
+        const raionCount = hData.active_raions_count ?? Math.max(0, (hData.official_sirens_count || 0) - oblCount);
+        if (oblCount > 0 && raionCount > 0) {
+          document.getElementById("statSirens").innerText = `${oblCount} обл. ${raionCount} районів`;
+        } else if (oblCount > 0) {
+          document.getElementById("statSirens").innerText = `${oblCount} обл.`;
+        } else if (raionCount > 0) {
+          document.getElementById("statSirens").innerText = `${raionCount} районів`;
+        } else {
+          document.getElementById("statSirens").innerText = "Спокійно";
+        }
         document.getElementById("statMig").innerText = hData.mig31k_active ? "АКТИВНА" : "НЕТ";
         document.getElementById("statMig").className = "text-2xl font-bold mt-1 " + (hData.mig31k_active ? "text-red-400 animate-pulse" : "text-cyan-400");
 
@@ -4175,6 +4187,8 @@ def create_app() -> web.Application:
         "service": "Air Alert Hub",
         "active_threats_count": len(state.tracker.tracks),
         "official_sirens_count": len(state.official_alerts),
+        "active_oblasts_count": sum(1 for a in state.official_alerts.values() if a.get("type") == "State") or sum(1 for ob in state.oblast_alerts.values() if ob.get("alert")),
+        "active_raions_count": sum(1 for a in state.official_alerts.values() if a.get("type") != "State"),
         "mig31k_active": state.mig_active,
         "upstream_provider": state.upstream_provider,
         "upstream_name": "Основной (WebSocket map.ukrainealarm.com)" if state.upstream_provider == "ukrainealarm" else ("Резервный (REST neptun.in.ua)" if state.upstream_provider == "neptun_failover" else "Ожидание подключения"),
