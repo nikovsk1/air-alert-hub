@@ -18,6 +18,7 @@ Features:
 import asyncio
 import base64
 import http.cookiejar
+import ipaddress
 import inspect
 import json
 import logging
@@ -164,7 +165,7 @@ class StorageManager:
         self.save()
 
     def save(self):
-        tmp_file = self.filepath + f".tmp.{os.getpid()}"
+        tmp_file = self.filepath + f".tmp.{os.getpid()}_{int(time.time()*1000)}"
         try:
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -306,8 +307,12 @@ class StorageManager:
         self._normalize_user(user)
         slot = user["slots"][str(slot_id)]
         if name: slot["name"] = name.strip()
-        if lat is not None: slot["lat"] = float(lat)
-        if lon is not None: slot["lon"] = float(lon)
+        if lat is not None or lon is not None:
+            if lat is not None: slot["lat"] = float(lat)
+            if lon is not None: slot["lon"] = float(lon)
+            # Скидаємо кеш області при зміні координат
+            slot.pop("cached_oblast", None)
+            slot.pop("cached_oblast_id", None)
         if danger_radius_km is not None:
             try:
                 val = float(danger_radius_km)
@@ -358,6 +363,9 @@ class StorageManager:
         dyn_slot["lat"] = float(lat)
         dyn_slot["lon"] = float(lon)
         dyn_slot["updated_at"] = int(time.time())
+        # Скидаємо кеш області динамічного слота при переміщенні
+        dyn_slot.pop("cached_oblast", None)
+        dyn_slot.pop("cached_oblast_id", None)
         dyn_slot["accuracy_m"] = float(accuracy_m)
         if name: dyn_slot["name"] = name.strip()
         if danger_radius_km is not None:
@@ -515,14 +523,15 @@ def classify_target(raw_type: str, raw_code: int = 0) -> tuple[str, dict]:
     key = raw_type or f"code_{raw_code}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if key not in UNKNOWN_TARGET_TYPES_CATALOG:
-        UNKNOWN_TARGET_TYPES_CATALOG[key] = {
-            "type_identifier": key,
-            "raw_code": raw_code,
-            "first_seen": now_iso,
-            "last_seen": now_iso,
-            "count": 1
-        }
-        logger.warning(f"⚠️ [NEW_TARGET_TYPE_DETECTED] Upstream returned new threat type: '{key}' (code={raw_code}). Registered in unknown types catalog.")
+        if len(UNKNOWN_TARGET_TYPES_CATALOG) < 100:
+            UNKNOWN_TARGET_TYPES_CATALOG[key] = {
+                "type_identifier": key,
+                "raw_code": raw_code,
+                "first_seen": now_iso,
+                "last_seen": now_iso,
+                "count": 1
+            }
+            logger.warning(f"⚠️ [NEW_TARGET_TYPE_DETECTED] Upstream returned new threat type: '{key}' (code={raw_code}). Registered in unknown types catalog.")
     else:
         UNKNOWN_TARGET_TYPES_CATALOG[key]["last_seen"] = now_iso
         UNKNOWN_TARGET_TYPES_CATALOG[key]["count"] += 1
@@ -752,6 +761,12 @@ class HistoryManager:
     def _load_month_data(self, month_str):
         if month_str in self._cache:
             return self._cache[month_str]
+        # Захист пам'яті (OOM): тримаємо в кеші не більше 3 місяців
+        if len(self._cache) >= 3:
+            for k in list(self._cache.keys()):
+                if k not in self.dirty_months and k != month_str:
+                    del self._cache[k]
+                    break
         filepath = os.path.join(self.history_dir, f"flight_history_{month_str}.json")
         if os.path.exists(filepath):
             try:
@@ -792,8 +807,17 @@ class HistoryManager:
                 d["total_targets"] = len(d["targets"])
                 d["updated_at"] = int(now)
 
+                # Очищення завислих активних треків (> 30 хв без оновлення)
+                stale_tids = [tid for tid, ent in self.active_tracks.items() if ent.get("path") and (now - ent["path"][-1][0] > 1800)]
+                for tid in stale_tids:
+                    st_entry = self.active_tracks.pop(tid, None)
+                    if st_entry:
+                        st_entry["status"] = "lost"
+                        st_entry["end_time"] = int(now)
+                        d["targets"][tid] = st_entry
+
                 filepath = os.path.join(self.history_dir, f"flight_history_{m}.json")
-                tmp_path = filepath + ".tmp"
+                tmp_path = filepath + f".tmp.{os.getpid()}_{int(time.time()*1000)}"
                 try:
                     with open(tmp_path, "w", encoding="utf-8") as f:
                         json.dump(d, f, ensure_ascii=False, separators=(',', ':'))
@@ -915,17 +939,29 @@ class HistoryManager:
         return self.get_history(month_str, date_str=date_str)
 
     def import_external_history(self, raw_data: dict) -> int:
-        items = raw_data.values() if isinstance(raw_data, dict) else raw_data
+        if not isinstance(raw_data, (dict, list)):
+            return 0
+        items = list(raw_data.values()) if isinstance(raw_data, dict) else raw_data
+        if len(items) > 5000:
+            items = items[:5000] # захист від DoS та переповнення пам'яті
         count = 0
         for item in items:
+            if not isinstance(item, dict): continue
             tid = item.get("display_id") or item.get("id")
             if not tid: continue
-            raw_t = item.get("type", "")
-            raw_c = item.get("raw_type_code", 0)
+            raw_t = str(item.get("type", ""))
+            raw_c = int(item.get("raw_type_code", 0) or 0)
             cat, meta = classify_target(raw_t, raw_c)
-            s_time = item.get("start_time", 0)
-            e_time = item.get("end_time", s_time)
-            dt_str = time.strftime("%Y-%m-%d", time.gmtime(s_time))
+            try:
+                s_time = float(item.get("start_time", 0))
+                if s_time <= 0 or s_time > 4102444800:
+                    s_time = time.time()
+                e_time = float(item.get("end_time", s_time))
+                dt_str = time.strftime("%Y-%m-%d", time.gmtime(s_time))
+            except Exception:
+                dt_str = time.strftime("%Y-%m-%d", time.gmtime())
+                s_time = time.time()
+                e_time = s_time
             m_str = dt_str[:7]
 
             raw_path = item.get("path", [])
@@ -1294,7 +1330,7 @@ class ThreatState:
                     if ob_id not in active:
                         active[ob_id] = {
                             "name": ob_name,
-                            "type": "State",
+                            "type": "Raion", # Не підміняємо район на цілу область!
                             "since": r_item.get("since", ""),
                             "alerts": [{
                                 "type": "AIR",
@@ -1333,6 +1369,9 @@ class ThreatState:
                             alert_siren: bool = None,
                             alert_mig: bool = None,
                             alert_artillery: bool = None) -> dict:
+        if not self.oblast_alerts:
+            self.recompute_oblast_alerts()
+
         slots = user.get("slots", {})
         target_slot = slots.get(str(slot_id))
         if not target_slot and slots:
@@ -1432,6 +1471,26 @@ class ThreatState:
             s_oblast = s_data["cached_oblast"]
             s_rid = s_data["cached_oblast_id"]
 
+            # Пріоритет: динамічна ціль (GPS смартфона) має менший пріоритет, ніж статичні точки.
+            # Якщо динамічна точка перебуває в радіусі дії будь-якої статичної точки (наприклад, вдома або на роботі),
+            # вона приймає область і статус статичної точки!
+            if s_data.get("type") == "dynamic":
+                for other_id, other_slot in slots.items():
+                    if other_id != s_id and other_slot.get("type", "static") == "static":
+                        st_lat, st_lon = other_slot.get("lat"), other_slot.get("lon")
+                        if st_lat is not None and st_lon is not None:
+                            st_r = float(other_slot.get("danger_radius_km", u_settings.get("danger_radius_km", DANGER_RADIUS_KM)))
+                            dist_to_static = calculate_haversine_distance(s_lat, s_lon, float(st_lat), float(st_lon))
+                            if dist_to_static <= st_r:
+                                if "cached_oblast" in other_slot and "cached_oblast_id" in other_slot:
+                                    s_oblast = other_slot["cached_oblast"]
+                                    s_rid = other_slot["cached_oblast_id"]
+                                else:
+                                    st_info = oblast_detector.find_oblast_info(float(st_lat), float(st_lon))
+                                    s_oblast = st_info["name"]
+                                    s_rid = st_info["id"]
+                                break
+
             threats_in_s_oblast = sum(1 for trk in active_tracks if trk.oblast == s_oblast)
 
             s_min_trk = None
@@ -1452,8 +1511,8 @@ class ThreatState:
                 if diff < 65.0:
                     s_eta = round((s_min / s_min_trk.speed_kmh) * 60.0, 1)
 
-            # Официальная тревога в области слота (даже если физических целей еще нет)
-            is_official_alert = (s_rid in self.official_alerts) or ("31" in self.official_alerts and s_rid == "14")
+            # Офіційна тривога в області слота (без хибного змішування Києва і Київської області)
+            is_official_alert = s_rid in self.official_alerts
             alert_meta = self.official_alerts.get(s_rid, {})
 
             user_slots_stats[s_id] = {
@@ -1751,11 +1810,12 @@ def extract_targets(decoded_data):
     def search_global(node):
         nonlocal found_coords, found_types, found_targets
         if isinstance(node, list):
-            if found_coords is None and len(node) > 0 and isinstance(node[0], list) and len(node[0]) >= 4 and all(isinstance(x, float) and 0 <= x <= 1.0 for x in node[0][:4]):
+            # Підтримка як float, так і int (наприклад 0 або 1)
+            if found_coords is None and len(node) > 0 and isinstance(node[0], list) and len(node[0]) >= 4 and all(isinstance(x, (int, float)) and 0 <= x <= 1.0 for x in node[0][:4]):
                 found_coords = node
             if found_types is None and len(node) > 0 and isinstance(node[0], list) and len(node[0]) >= 3 and isinstance(node[0][0], int) and isinstance(node[0][1], str):
                 found_types = node
-            if found_targets is None and len(node) > 0 and isinstance(node[0], list) and len(node[0]) >= 8 and isinstance(node[0][0], int) and isinstance(node[0][7], float):
+            if found_targets is None and len(node) > 0 and isinstance(node[0], list) and len(node[0]) >= 8 and isinstance(node[0][0], int) and isinstance(node[0][7], (int, float)):
                 found_targets = node
             for item in node:
                 if isinstance(item, list): search_global(item)
@@ -1914,7 +1974,8 @@ async def run_official_alerts_collector():
             req = urllib.request.Request(update_url, headers=BROWSER_HEADERS)
             raw = await asyncio.to_thread(lambda: fetch_url_text(req, opener_inst=opener, timeout=10))
             data = json.loads(raw)
-            await state.update_official_alerts(data)
+            if data and isinstance(data, dict) and "alerts" in data:
+                await state.update_official_alerts(data)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1950,7 +2011,7 @@ async def run_failover_neptun_collector():
                             "oblast": ob_info["name"],
                             "oblast_id": ob_info["id"],
                             "heading": heading,
-                "heading_deg": heading,
+                            "heading_deg": heading,
                             "speed_kmh": meta["default_speed"]
                         })
                     await state.update_threats(normalized, provider="neptun_failover")
@@ -1974,25 +2035,35 @@ async def run_failover_neptun_collector():
 
 def is_external_request(request: web.Request) -> bool:
     """
-    Определяет, пришёл ли запрос из внешнего интернета (через Cloudflare Tunnel или внешний прокси).
-    Защищает админку и мастер-ключи от любого доступа извне.
+    Визначає, чи надійшов запит із зовнішнього інтернету (Cloudflare Tunnel, зовнішній проксі або публічна IP-адреса).
+    Надійно захищає адмінку та майстер-ключі від доступу ззовні з перевіркою через ipaddress.
     """
-    # Cloudflare Tunnel всегда добавляет заголовок CF-Connecting-IP и CF-Ray
+    # Cloudflare Tunnel завжди додає заголовок CF-Connecting-IP та CF-Ray
     if request.headers.get("CF-Connecting-IP") or request.headers.get("CF-Ray"):
         return True
-    # Проверка цепочки прокси X-Forwarded-For на наличие внешних публичных IP
+
+    # Перевіряємо всі IP у ланцюжку X-Forwarded-For
     xff = request.headers.get("X-Forwarded-For")
     if xff:
-        client_ip = xff.split(",")[0].strip()
-        # Разрешаем только локальные приватные подсети (LAN)
-        is_private = (
-            client_ip.startswith("192.168.") or
-            client_ip.startswith("10.") or
-            client_ip.startswith("127.") or
-            client_ip.startswith("172.")
-        )
-        if not is_private:
+        ips = [x.strip() for x in xff.split(",") if x.strip()]
+        for raw_ip in ips:
+            try:
+                ip_obj = ipaddress.ip_address(raw_ip)
+                if not (ip_obj.is_private or ip_obj.is_loopback):
+                    return True
+            except ValueError:
+                return True
+
+    # Перевіряємо безпосередню IP-адресу клієнта
+    peer_ip = request.remote
+    if peer_ip:
+        try:
+            ip_obj = ipaddress.ip_address(peer_ip)
+            if not (ip_obj.is_private or ip_obj.is_loopback):
+                return True
+        except ValueError:
             return True
+
     return False
 
 def is_admin(request: web.Request) -> bool:
@@ -2143,13 +2214,18 @@ async def handle_update_dynamic(request: web.Request):
     if not user: return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         data = await request.json()
+        lat_val = data.get("lat") if data.get("lat") is not None else data.get("latitude")
+        lon_val = data.get("lon") if data.get("lon") is not None else data.get("longitude")
+        if lat_val is None or lon_val is None:
+            return web.json_response({"error": "Missing coordinates: lat/lon or latitude/longitude required"}, status=400)
+
         slot = storage.update_dynamic_slot(
             user["api_key"],
-            lat=data.get("lat"),
-            lon=data.get("lon"),
+            lat=float(lat_val),
+            lon=float(lon_val),
             name=data.get("name"),
-            accuracy_m=data.get("accuracy_m", 0.0),
-            danger_radius_km=data.get("danger_radius_km")
+            accuracy_m=float(data.get("accuracy_m", data.get("accuracy", 0.0))),
+            danger_radius_km=parse_float_param(data.get("danger_radius_km") or data.get("danger_radius"))
         )
         return web.json_response({"status": "success", "slot": slot})
     except Exception as e: return web.json_response({"error": str(e)}, status=400)
@@ -2933,6 +3009,8 @@ ADMIN_HTML = """<!DOCTYPE html>
       document.getElementById("adminApp").classList.remove("hidden");
       updateTelemetry();
       loadKeys();
+      loadHistoryConfig();
+      loadAdminHistory();
       if (!telemetryInterval) {
         telemetryInterval = setInterval(updateTelemetry, 4000);
       }
@@ -3210,11 +3288,19 @@ ADMIN_HTML = """<!DOCTYPE html>
         `;
         tbody.appendChild(tr);
       });
+
+      // Автоматичне відновлення активного користувача та відображення актуальних параметрів у полях
+      const lastKey = localStorage.getItem("air_alert_last_edit_key");
+      const targetUser = (lastKey && cachedUsers[lastKey]) ? cachedUsers[lastKey] : (users.length === 1 ? users[0] : null);
+      if (targetUser) {
+        editUserSlots(targetUser.api_key, targetUser.owner);
+      }
     }
 
     async function editUserSlots(apiKey, owner) {
       if (!currentAdminKey) return showLoginScreen();
       currentEditApiKey = apiKey;
+      localStorage.setItem("air_alert_last_edit_key", apiKey);
       const res = await fetch("/api/v1/slots?token=" + encodeURIComponent(apiKey) + "&admin_key=" + encodeURIComponent(currentAdminKey));
       if (!res.ok) return alert("Ошибка чтения слотов пользователя");
       const data = await res.json();
@@ -3527,6 +3613,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ gdrive_url: url })
         });
         alert("Посилання на Google Диск збережено!");
+        loadHistoryConfig();
       } catch (e) {
         alert("Помилка збереження: " + e);
       }
@@ -3541,6 +3628,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ gdrive_webhook: webhook })
         });
         alert("Webhook Google Apps Script збережено!");
+        loadHistoryConfig();
       } catch (e) {
         alert("Помилка збереження: " + e);
       }
@@ -3838,10 +3926,14 @@ RADAR_MAP_HTML = """<!DOCTYPE html>
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    // Dark tactical basemap (CartoDB Dark Matter)
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      maxZoom: 18,
-      subdomains: 'abcd'
+    // Dark tactical basemap (Esri World Dark Gray - no API key watermark)
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 16,
+      attribution: '&copy; Esri, HERE, Garmin'
+    }).addTo(map);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 16,
+      pane: 'overlayPane'
     }).addTo(map);
 
     let threatLayers = {};   // id -> { marker, heatTrail, futureCorridor }
