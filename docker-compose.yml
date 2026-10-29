@@ -1,0 +1,23 @@
+services:
+  air-alert-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: air-alert-hub
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      # Постоянное хранилище API-ключей и настроек слотов (сохраняется при перезагрузках)
+      - ./data:/app/data
+    environment:
+      - PORT=8088
+      - DATA_DIR=/app/data
+      # Мастер-ключ адміністратора для входу у веб-панель /admin (можна перевизначити через .env або середовище)
+      - ADMIN_SECRET_KEY=${ADMIN_SECRET_KEY:-admin_super_secret_master_key_123}
+      - DANGER_RADIUS_KM=35
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
