@@ -1527,7 +1527,8 @@ class ThreatState:
             "closest_threat": closest_threat,
             "slots": user_slots_stats,
             "threats": processed,
-            "map_oblasts": list(self.oblast_alerts.values()) if self.oblast_alerts else []
+            "map_oblasts": list(self.oblast_alerts.values()) if self.oblast_alerts else [],
+            "oblasts": list(self.oblast_alerts.values()) if self.oblast_alerts else []
         }
 
     def build_radar_projection(self, user: dict, slot_id: str = "1", radius_km: float = 100.0,
