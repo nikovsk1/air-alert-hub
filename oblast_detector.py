@@ -10,6 +10,8 @@ class OblastDetector:
         self.regions = []
         self.oblasts_by_id = {}
         self.region_to_oblast = {}
+        self.raions_by_id = {}
+        self.raion_name_to_id = {}
 
         if not os.path.exists(geojson_path):
             return
@@ -56,9 +58,11 @@ class OblastDetector:
             # 2. Построение маппинга для районов (Rank 2) и громад (Rank 3)
             for feat in d.get("features", []):
                 props = feat.get("properties", {})
-                if props.get("rank") == 1:
+                rank = props.get("rank")
+                if rank == 1:
                     continue
                 rid = str(props.get("regionId"))
+                rname = props.get("name", "")
                 geom = feat.get("geometry", {})
                 polygons = []
                 if geom.get("type") == "Polygon":
@@ -93,6 +97,18 @@ class OblastDetector:
 
                 if f_id:
                     self.region_to_oblast[rid] = f_id
+
+                if rank == 2:
+                    self.raions_by_id[rid] = {
+                        "id": rid,
+                        "name": rname,
+                        "oblast_id": f_id or "0"
+                    }
+                    if rname:
+                        rn_lower = rname.lower().strip()
+                        self.raion_name_to_id[rn_lower] = rid
+                        short = rn_lower.replace("район", "").strip()
+                        self.raion_name_to_id[short] = rid
 
         except Exception as e:
             print(f"[WARN] Ошибка загрузки regions.geojson: {e}")
@@ -158,6 +174,25 @@ class OblastDetector:
                 "bbox": [round(x, 4) for x in r["bbox"]]
             })
         return result
+
+    def get_raion_id_by_name(self, name: str) -> str:
+        """Поиск ID района (Rank 2) по его названию."""
+        if not name:
+            return "0"
+        n = name.lower().strip()
+        if n in self.raion_name_to_id:
+            return self.raion_name_to_id[n]
+        short_n = n.replace("район", "").strip()
+        if short_n in self.raion_name_to_id:
+            return self.raion_name_to_id[short_n]
+        for k, v in self.raion_name_to_id.items():
+            if len(k) > 4 and (k in n or n in k):
+                return v
+        return "0"
+
+    def get_all_raions(self) -> list:
+        """Возвращает список всех районов (Rank 2)."""
+        return list(self.raions_by_id.values())
 
     def find_oblast_info(self, lat: float, lon: float) -> dict:
         if not self.regions:
